@@ -130,14 +130,40 @@ def fase_split(vid, t):
         raise SystemExit("*** SIN CSV: scenedetect no detecto nada "
                          "(video corrupto o -t muy alto) ***")
     kept = []
+
+    def _col(row, *aliases):
+        norm = {k.strip().lower(): k for k in row.keys()}
+        for a in aliases:
+            if a in norm:
+                return row[norm[a]]
+        return None
+
     with open(csvp) as f:
-        for r in csv.DictReader(f):
-            if float(r["Length (seconds)"]) < 2.0:
-                continue
-            nm = f"seg{len(kept) + 1:02d}"
-            sh(f"ffmpeg -y -v error -ss {r['Start Timecode']} -to {r['End Timecode']} "
-               f"-i {IN}/{vid}.mp4 -c copy {segdir}/{nm}.mp4", check=True)
-            kept.append((nm, r["Start Timecode"], r["End Timecode"]))
+        rows = list(csv.DictReader(f))
+    if rows:
+        hdr = list(rows[0].keys())
+        t0 = _col(rows[0], "start time (seconds)", "start time", "start_time",
+                  "start (seconds)", "start")
+        t1 = _col(rows[0], "end time (seconds)", "end time", "end_time",
+                  "end (seconds)", "end")
+        s0 = _col(rows[0], "start timecode", "start_timecode", "start_tc", "start tc")
+        s1 = _col(rows[0], "end timecode", "end_timecode", "end_tc", "end tc")
+        if t0 is None or t1 is None or s0 is None or s1 is None:
+            raise SystemExit("*** CSV con columnas desconocidas. Vistas: "
+                             f"{hdr}. Pega esto para ajustar alias ***")
+    for r in rows:
+        t0 = _col(r, "start time (seconds)", "start time", "start_time",
+                  "start (seconds)", "start")
+        t1 = _col(r, "end time (seconds)", "end time", "end_time",
+                  "end (seconds)", "end")
+        s0 = _col(r, "start timecode", "start_timecode", "start_tc", "start tc")
+        s1 = _col(r, "end timecode", "end_timecode", "end_tc", "end tc")
+        if float(t1) - float(t0) < 2.0:
+            continue
+        nm = f"seg{len(kept) + 1:02d}"
+        sh(f"ffmpeg -y -v error -ss {s0} -to {s1} "
+           f"-i {IN}/{vid}.mp4 -c copy {segdir}/{nm}.mp4", check=True)
+        kept.append((nm, s0, s1))
     if not kept:
         raise SystemExit("*** 0 SEGMENTOS >=2s: baja el umbral o revisa el video ***")
     print("  SEGMENTOS:", [k[0] for k in kept])
