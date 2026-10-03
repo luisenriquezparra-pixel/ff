@@ -1,20 +1,11 @@
 #!/usr/bin/env python3
-"""Pipeline ganador seg01 (GVHMR preciso + piso MoGe-2) — mega-script 1-archivo.
-
-Uso en Kaggle (2 lineas a mano, nada mas):
-    !git clone https://github.com/luisenriquezparra-pixel/ff.git
-    !python3 ff/run.py
-El script pregunta VID? -> escribes el nombre del video (sin .mp4, debe estar
-en /kaggle/working/inputs_demo/ o adjuntado en /kaggle/input) y corre TODO:
-modelos -> split -> lote por segmento -> zip en Resultados/ (SOLO el zip).
-
-Receta locked: -s camara fija, --f-mm con guion (24 = 1x iPhone), --no-render
-siempre (bug vertical), PySceneDetect -t 27, MoGe-2 vitb-normal (NO v3),
-tobillos ventana 7x7 (NUNCA 1 pixel), regla std>6cm = tobillo descartado.
-
-Publico-seguro: SIN secretos, SIN claves, SIN pesos adentro. SMPLX (gated MPI)
-llega via Kaggle API desde TU dataset privado (Secrets KAGGLE_USERNAME/KEY);
-si no hay secrets, pide adjuntar el dataset a mano. Todo lo demas es publico.
+"""Pipeline seg01: GVHMR + piso MoGe-2. Uso:
+    !python3 ff/run.py --instalar   (solo modelos)
+    VID = 'nombre'                   (celda aparte)
+    !python3 ff/run.py $VID          (todo -> zip en Resultados/)
+Receta: -s, --f-mm 24, --no-render, PySceneDetect -t 27, MoGe-2 vitb,
+tobillos 7x7, std>6cm = descartado. Sin report OK no va a BVH.
+SMPLX via API (Secrets); resto publico. Sin secretos ni pesos adentro.
 """
 import csv
 import datetime
@@ -63,7 +54,6 @@ def fase_modelos():
     os.makedirs(IN, exist_ok=True)
     os.makedirs(OUT, exist_ok=True)
 
-    # kaggle.json desde Secrets (o el que ya exista)
     kp = os.path.join(os.environ.get("HOME", "/root"), ".kaggle", "kaggle.json")
     if not os.path.exists(kp):
         try:
@@ -78,7 +68,6 @@ def fase_modelos():
         except Exception as e:
             print(f"  *** SIN Secrets ({e}): SMPLX solo via Add Input manual ***")
 
-    # SMPLX via API desde dataset privado propio (legal: tu copia, tu cuenta)
     npz = f"{BM}/smplx/SMPLX_NEUTRAL.npz"
     pkl = f"{BM}/smpl/SMPL_NEUTRAL.pkl"
     if not (os.path.exists(npz) and os.path.exists(pkl)):
@@ -126,7 +115,6 @@ def video_in():
 
 
 def pedir_vid(vids):
-    # Reservado: VID siempre llega por argv (celda del usuario). Sin prompts.
     raise SystemExit("*** Falta VID: corre como !python3 ff/run.py $VID ***")
 
 
@@ -346,7 +334,6 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     print("== PIPELINE GANADOR seg01 | GVHMR preciso + piso MoGe-2 ==")
     if argv[:1] == ["--instalar"]:
-        # CELDA INSTALAR: solo modelos, termina limpio. Sin prompts.
         fase_modelos()
         print("MODELOS-OK (instalacion completa, nada mas que hacer aqui)")
         return
@@ -368,8 +355,6 @@ def main(argv=None):
     except Exception:
         t = T_DEFAULT
     print(f"VID={vid} FMM={fmm} T={t} (argv; sin prompts)")
-    # Modelos: verifica rapido, instala solo lo que falte (pip tarda segundos
-    # si ya esta; SMPLX/API igual con checkpoints de archivos).
     fase_modelos()
     vids = video_in()
     if vid not in vids:
