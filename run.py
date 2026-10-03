@@ -126,13 +126,8 @@ def video_in():
 
 
 def pedir_vid(vids):
-    while True:
-        vid = input("VID? (nombre exacto, sin .mp4) ").strip()
-        if vid.endswith(".mp4"):
-            vid = vid[:-4]
-        if vid in vids:
-            return vid
-        print(f"  *** '{vid}' no esta en la lista. Opciones: {', '.join(vids)} ***")
+    # Reservado: VID siempre llega por argv (celda del usuario). Sin prompts.
+    raise SystemExit("*** Falta VID: corre como !python3 ff/run.py $VID ***")
 
 
 # ------------------------------------------------------------------ SPLIT
@@ -347,19 +342,39 @@ def fase_zip(vid):
     print(f"  ZIP-OK: {zf}  <-- baja este archivo con 1 clic")
 
 
-def main():
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
     print("== PIPELINE GANADOR seg01 | GVHMR preciso + piso MoGe-2 ==")
-    fase_modelos()
-    vids = video_in()
-    vid = pedir_vid(vids)
+    if argv[:1] == ["--instalar"]:
+        # CELDA INSTALAR: solo modelos, termina limpio. Sin prompts.
+        fase_modelos()
+        print("MODELOS-OK (instalacion completa, nada mas que hacer aqui)")
+        return
+    if not argv:
+        raise SystemExit("*** Sin VID: corre como !python3 ff/run.py $VID "
+                         "(celda aparte con VID = 'nombre') ***")
+    if argv[0].startswith("--"):
+        raise SystemExit("*** Flags validos: --instalar | $VID [FMM] [T]. "
+                         "Ej: !python3 ff/run.py $VID ***")
+    vid = argv[0]
+    if vid.endswith(".mp4"):
+        vid = vid[:-4]
     try:
-        fmm = int(input(f"FMM? focal 35mm-equiv [Enter={FMM_DEFAULT}] ").strip() or FMM_DEFAULT)
+        fmm = int(argv[1]) if len(argv) > 1 else FMM_DEFAULT
     except Exception:
         fmm = FMM_DEFAULT
     try:
-        t = int(input(f"T? umbral de corte [Enter={T_DEFAULT}] ").strip() or T_DEFAULT)
+        t = int(argv[2]) if len(argv) > 2 else T_DEFAULT
     except Exception:
         t = T_DEFAULT
+    print(f"VID={vid} FMM={fmm} T={t} (argv; sin prompts)")
+    # Modelos: verifica rapido, instala solo lo que falte (pip tarda segundos
+    # si ya esta; SMPLX/API igual con checkpoints de archivos).
+    fase_modelos()
+    vids = video_in()
+    if vid not in vids:
+        raise SystemExit(f"*** VID '{vid}' no esta en inputs_demo/. Opciones: "
+                         f"{', '.join(vids)} (revisa letra por letra) ***")
     segdir, segs = fase_split(vid, t)
     res = fase_lote(vid, fmm, segdir, segs)
     fase_zip(vid)
