@@ -83,7 +83,7 @@ def fase_modelos():
         raise SystemExit("*** FALTA SMPLX: adjunta tu dataset smplx-neutral-npz "
                          "(Add Input) y re-corre. Nada mas que hacer a mano. ***")
 
-    sh("pip install \"gvhmr[preproc]\" \"scenedetect[opencv]\" huggingface_hub 2>&1 | tail -1")
+    sh("pip install \"gvhmr[preproc]\" \"scenedetect[opencv]\" huggingface_hub scipy 2>&1 | tail -1")
     if not os.path.exists(f"{W}/MoGe"):
         sh(f"git clone https://github.com/microsoft/MoGe.git {W}/MoGe 2>&1 | tail -1")
     os.environ["GVHMR_BODY_MODELS"] = BM
@@ -164,6 +164,96 @@ def fase_split(vid, t):
 
 
 # ------------------------------------------------------------------- LOTE
+NAMES22 = ["Pelvis", "L_Hip", "R_Hip", "Spine1", "L_Knee", "R_Knee", "Spine2",
+           "L_Ankle", "R_Ankle", "Spine3", "L_Foot", "R_Foot", "Neck",
+           "L_Collar", "R_Collar", "Head", "L_Shoulder", "R_Shoulder",
+           "L_Elbow", "R_Elbow", "L_Wrist", "R_Wrist"]
+_MODEL = None
+
+
+def _model():
+    global _MODEL
+    if _MODEL is None:
+        import smplx
+        _MODEL = smplx.create(BM, model_type="smplx", gender="neutral", batch_size=1)
+    return _MODEL
+
+
+def escribir_bvh(d, bvh_path):
+    import torch
+    import numpy as np
+    from scipy.spatial.transform import Rotation
+    g = d["smpl_params_global"]
+    n = g["body_pose"].shape[0]
+    body_pose = g["body_pose"].reshape(n, 21, 3).float()
+    global_orient = g["global_orient"].float()
+    betas_mean = g["betas"].float().mean(dim=0, keepdim=True)
+    transl_all = g["transl"].float().numpy()
+    model = _model()
+    with torch.no_grad():
+        rest = model(betas=betas_mean).joints[0, :22].detach().numpy()
+    parents = model.parents[:22].tolist()
+    offsets = rest - rest[[0 if p < 0 else p for p in parents]]
+    offsets[0] = np.zeros(3)
+    pelvis = np.zeros((n, 3))
+    with torch.no_grad():
+        for st in range(0, n, 400):
+            e = min(st + 400, n)
+            B = e - st
+            z3 = torch.zeros(B, 3)
+            out = model(betas=betas_mean.expand(B, -1).contiguous(),
+                        body_pose=body_pose[st:e], global_orient=global_orient[st:e],
+                        jaw_pose=z3, leye_pose=z3, reye_pose=z3,
+                        left_hand_pose=torch.zeros(B, 6),
+                        right_hand_pose=torch.zeros(B, 6),
+                        expression=torch.zeros(B, 10), transl=torch.zeros(B, 3))
+            pelvis[st:e] = out.joints[:, 0].detach().numpy() + transl_all[st:e]
+    aa = np.concatenate([global_orient.numpy()[:, None, :], body_pose.numpy()], axis=1)
+    eul = Rotation.from_rotvec(aa.reshape(-1, 3)).as_euler("ZXY", degrees=True).reshape(n, 22, 3)
+    children = [[] for _ in range(22)]
+    for j, p in enumerate(parents):
+        if p >= 0:
+            children[p].append(j)
+    order = []
+    lines = ["HIERARCHY", "ROOT Pelvis", "{",
+             "OFFSET 0.000000 0.000000 0.000000",
+             "CHANNELS 6 Xposition Yposition Zposition Zrotation Xrotation Yrotation"]
+
+    def block(j, depth):
+        order.append(j)
+        pad = "\t" * depth
+        lines.append(f"{pad}{'ROOT' if depth == 1 else 'JOINT'} {NAMES22[j]}")
+        lines.append(f"{pad}" + "{")
+        ox, oy, oz = offsets[j]
+        lines.append(f"{pad}\tOFFSET {ox:.6f} {oy:.6f} {oz:.6f}")
+        ch = "6 Xposition Yposition Zposition " if j == 0 else "3 "
+        lines.append(f"{pad}\tCHANNELS {ch}Zrotation Xrotation Yrotation")
+        if not children[j]:
+            dv = offsets[j]
+            nv = np.linalg.norm(dv)
+            dv = dv / nv if nv > 1e-8 else np.array([0.0, -1.0, 0.0])
+            ex, ey, ez = dv * 0.12
+            lines.append(f"{pad}\tEnd Site")
+            lines.append(f"{pad}\t" + "{")
+            lines.append(f"{pad}\t\tOFFSET {ex:.6f} {ey:.6f} {ez:.6f}")
+            lines.append(f"{pad}\t" + "}")
+        else:
+            for c in children[j]:
+                block(c, depth + 1)
+        lines.append(f"{pad}" + "}")
+
+    for c in children[0]:
+        block(c, 2)
+    order.insert(0, 0)
+    lines += ["}", "MOTION", f"Frames: {n}", f"Frame Time: {1.0 / FPS:.6f}"]
+    for i in range(n):
+        vals = [f"{pelvis[i, 0]:.6f}", f"{pelvis[i, 1]:.6f}", f"{pelvis[i, 2]:.6f}"]
+        for j in order:
+            z, x, y = eul[i, j]
+            vals += [f"{z:.6f}", f"{x:.6f}", f"{y:.6f}"]
+        lines.append(" ".join(vals))
+    with open(bvh_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
 def fase_lote(vid, fmm, segdir, segs):
     phase("[4/5] LOTE (receta + piso + delta + depths + report)")
     import torch
@@ -275,6 +365,8 @@ def fase_lote(vid, fmm, segdir, segs):
                 rep.append("delta=0 (SIN corregir: velocidad anotada)")
             rep.append("FLAGS: " + (" ".join(flags) if flags else "OK"))
             torch.save(d, f"{R}/{nm}_corrected.pt")
+            escribir_bvh(d, f"{R}/{nm}.bvh")
+            rep.append(f"bvh={nm}.bvh")
             bb = d["bbx_xys"]
             bb = (bb.numpy() if torch.is_tensor(bb) else bb).astype(float)
             cap = cv2.VideoCapture(norm)
