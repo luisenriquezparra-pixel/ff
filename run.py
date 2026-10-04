@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Pipeline seg01: GVHMR + piso MoGe-2. Uso:
+"""Pipeline multi-persona: GVHMR + piso MoGe-2 por ID. Uso:
     !python3 ff/run.py --instalar   (solo modelos)
     VID = 'nombre'                   (celda aparte)
     !python3 ff/run.py $VID          (todo -> SOLO BVH en /kaggle/working/)
 Receta: -s, --f-mm 24, --no-render, PySceneDetect -t 27, MoGe-2 vitb,
-tobillos 7x7, std>6cm = descartado. Salida: {VID}_{seg}.bvh y nada mas.
+tobillos 7x7, std>6cm = descartado. Salida: {VID}_{seg}_id{ID}_{n}f.bvh
+y nada mas. 1 persona = 1 ID = 1 BVH. <60 frames = descartado con aviso.
 EDOD: ningun path se asume. Todo se DESCRIBE (nombre + candidatos +
-validador por contenido) y la ley resolver() lo encuentra donde este.
+validador por CONTENIDO) y la ley resolver() lo encuentra donde este.
+Personas = INDICES en arrays IDS[10], no objetos. Leyes: TRACK, TRACKLET,
+POSE-ID, PISO-ID, EXPORT-ID. Sin clases, sin self: datos + leyes.
 SMPLX via API (Secrets); resto publico. Sin secretos ni pesos adentro.
-"""
+Codigo libre: si falta algo (yaml, ultralytics) se autocrea o avisa VACIO.
+Nada revienta a mitad del lote: cada ID falla solo, los demas siguen."""
 import csv
 import datetime
 import glob
@@ -29,6 +33,53 @@ T_DEFAULT = 27
 FPS = 30
 MAX_IDS = 10
 MIN_FRAMES = 60
+
+
+# ---------------------------------------- CAPA IDS[10] (EDOD SoA)
+# Que existe: hasta MAX_IDS personas por segmento. Cada persona es un
+# INDICE i en estos arrays paralelos preasignados. Sin objetos, sin clases.
+# TRK = numero de track YOLO, NFR = frames visible, CNF = confianza media,
+# ACT = sigue viva en el lote. ID_N = cuantas posiciones estan en uso
+# (nunca se agrega, solo se reescriben posiciones: preasignacion total).
+ID_TRK = [0] * MAX_IDS
+ID_NFR = [0] * MAX_IDS
+ID_CNF = [0.0] * MAX_IDS
+ID_ACT = [False] * MAX_IDS
+ID_N = 0
+# Cajas por ID para recortar tracklets: CAJAS[i] = lista de
+# (frame_idx, x0, y0, x1, y1) en pixeles del segmento normalizado.
+ID_CAJAS = [[] for _ in range(MAX_IDS)]
+
+
+def ley_ids_limpiar():
+    """Ley previa: deja IDS[10] en cero. Toda corrida empieza aqui."""
+    global ID_N
+    for i in range(MAX_IDS):
+        ID_TRK[i] = 0
+        ID_NFR[i] = 0
+        ID_CNF[i] = 0.0
+        ID_ACT[i] = False
+        ID_CAJAS[i] = []
+    ID_N = 0
+
+
+def ley_rankear(hallazgos):
+    """Ley pura (sin GPU, sin archivos): recibe {trk: (frames, conf_media,
+    cajas)} y llena IDS[10] con el top por frames. Devuelve cuantos quedan
+    activos. Se prueba sin Kaggle, sin video, sin nada."""
+    global ID_N
+    ley_ids_limpiar()
+    orden = sorted(hallazgos.keys(),
+                   key=lambda t: hallazgos[t][0], reverse=True)[:MAX_IDS]
+    for i, t in enumerate(orden):
+        nfr, cnf, cajas = hallazgos[t]
+        ID_TRK[i] = int(t)
+        ID_NFR[i] = int(nfr)
+        ID_CNF[i] = float(cnf)
+        ID_ACT[i] = True
+        ID_CAJAS[i] = list(cajas)
+    ID_N = len(orden)
+    return ID_N
 
 
 def sh(cmd, tail=3, check=False):
@@ -415,7 +466,7 @@ def fase_modelos():
                          "(Add Input) y re-corre. Nada mas que hacer a mano. ***")
 
     sh("pip install \"gvhmr[preproc]\" \"scenedetect[opencv]\" huggingface_hub scipy "
-       "scikit-learn 2>&1 | tail -1")
+       "scikit-learn ultralytics 2>&1 | tail -1")
     if not os.path.exists(f"{W}/MoGe"):
         sh(f"git clone https://github.com/microsoft/MoGe.git {W}/MoGe 2>&1 | tail -1")
     # El clone sin install era el hueco: el modulo `moge` debe importarse.
@@ -443,6 +494,7 @@ def fase_modelos():
             ("scipy", "from scipy.spatial.transform import Rotation"),
             ("smplx", "import smplx"),
             ("sklearn", "from sklearn.linear_model import RANSACRegressor"),
+            ("ultralytics", "from ultralytics import YOLO"),
             ("cv2", "import cv2"),
             ("huggingface_hub", "import huggingface_hub")]:
         r = subprocess.run(f"python3 -c \"{imp}; print('OK-{nombre}')\"",
@@ -499,10 +551,6 @@ def video_in():
     for v in vids:
         print(f"   - {v}")
     return vids
-
-
-def pedir_vid(vids):
-    raise SystemExit("*** Falta VID: corre como !python3 ff/run.py $VID ***")
 
 
 # ------------------------------------------------------------------ SPLIT
@@ -570,26 +618,264 @@ def fase_split(vid, t):
     if not kept:
         raise SystemExit("*** 0 SEGMENTOS >=2s: baja el umbral o revisa el video ***")
     print("  SEGMENTOS:", [k[0] for k in kept])
+    # Sin JPG: salida final solo .bvh. El frame medio para piso se lee
+    # en memoria (cv2 directo) dentro de ley_piso, sin guardar nada.
+    return segdir, [k[0] for k in kept]
+
+
+# ------------------------------------------------- LEYES MULTI (EDOD)
+# Tablas, no ramas. Todo lo que puede fallar (pesos, yaml, video raro)
+# tiene fila de repuesto o aviso VACIO. Nada revienta el lote.
+TABLA_YOLO_TRACK = ["yolo26x.pt", "yolo11x.pt"]
+MARGEN_TRACKLET = 1.3
+YAML_BOTSORT_DEFECTO = """# BoT-SORT para IDs estables (autocreado por run.py si falta).
+tracker_type: botsort
+track_high_thresh: 0.5
+track_low_thresh: 0.1
+new_track_thresh: 0.6
+track_buffer: 90
+match_thresh: 0.8
+fuse_score: True
+proximity_thresh: 0.5
+appearance_thresh: 0.25
+with_reid: False
+gmc_method: none
+"""
+
+
+def buscar_tracker_yaml():
+    """El yaml vive junto a run.py. Si no existe se AUTOCREA desde la
+    tabla embebida: el codigo nunca depende del archivo. Libre."""
+    base = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "custom_tracker.yaml")
+    for cand in [base, "./custom_tracker.yaml",
+                 f"{W}/custom_tracker.yaml"]:
+        try:
+            if os.path.isfile(cand) and os.path.getsize(cand) > 100:
+                print(f"  [ENCONTRADO] TRACKER-YAML: {cand}")
+                return cand
+        except Exception:
+            continue
+    try:
+        with open(base, "w") as f:
+            f.write(YAML_BOTSORT_DEFECTO)
+        print(f"  [TRACKER-YAML] autocreado: {base}")
+        return base
+    except Exception as e:
+        print(f"  [TRACKER-YAML] sin archivo ({e}): uso botsort de fabrica")
+        return None
+
+
+def ley_trackear(seg_mp4):
+    """Ley TRACK: YOLO + BoT-SORT sobre el segmento, solo clase 0
+    (persona). Llena IDS[10] via ley_rankear (top por frames).
+    0 personas o sin ultralytics = VACIO con aviso, nunca error."""
+    try:
+        from ultralytics import YOLO
+    except Exception:
+        print("  [TRACK] sin ultralytics (re-corre --instalar): VACIO")
+        return 0
+    try:
+        yamlp = buscar_tracker_yaml() or "botsort.yaml"
+        modelo = None
+        for peso in TABLA_YOLO_TRACK:
+            try:
+                modelo = YOLO(peso)
+                print(f"  [TRACK] peso: {peso}")
+                break
+            except Exception as e:
+                print(f"  [TRACK] peso {peso} no cargo "
+                      f"({str(e)[:80]}), siguiente...")
+        if modelo is None:
+            print("  [TRACK] ningun peso YOLO cargo: VACIO")
+            return 0
+        hall = {}
+        for fidx, r in enumerate(modelo.track(
+                source=seg_mp4, tracker=yamlp, classes=[0],
+                verbose=False, persist=True)):
+            b = r.boxes
+            if b is None or b.id is None:
+                continue
+            for tid, xy, cf in zip(b.id.int().tolist(),
+                                   b.xyxy.tolist(), b.conf.tolist()):
+                e = hall.get(tid)
+                if e is None:
+                    hall[tid] = [1, float(cf),
+                                 [(fidx, float(xy[0]), float(xy[1]),
+                                   float(xy[2]), float(xy[3]))]]
+                else:
+                    e[0] += 1
+                    e[1] += float(cf)
+                    e[2].append((fidx, float(xy[0]), float(xy[1]),
+                                 float(xy[2]), float(xy[3])))
+        hallazgos = {t: (v[0], v[1] / v[0], v[2]) for t, v in hall.items()}
+        n = ley_rankear(hallazgos)
+        if n == 0:
+            print("  [TRACK] 0 personas: VACIO")
+            return 0
+        print(f"  [TRACK] {n} persona(s):")
+        for i in range(n):
+            print(f"    i={i} track={ID_TRK[i]} frames={ID_NFR[i]} "
+                  f"conf={ID_CNF[i]:.2f}")
+        return n
+    except Exception as e:
+        print(f"  [TRACK] fallo ({type(e).__name__}: {str(e)[:120]}): VACIO")
+        return 0
+
+
+def _tam_video(path):
+    pr = subprocess.run(
+        f"ffprobe -v error -select_streams v:0 "
+        f"-show_entries stream=width,height -of csv=p=0 \"{path}\"",
+        shell=True, capture_output=True, text=True)
+    nums = re.findall(r"\d+", pr.stdout or "")
+    if len(nums) < 2:
+        raise RuntimeError(f"ffprobe vacio para {path}")
+    return int(nums[0]), int(nums[1])
+
+
+def ley_tracklets(seg_mp4, segdir, nm):
+    """Ley TRACKLET: un mini-video por ID activo con >=MIN_FRAMES.
+    Recorte = union de sus cajas x MARGEN_TRACKLET, tiempo = su racha
+    (fidx/30). Sin codec raro: mismo normalize del pipeline. El ID corto
+    se apaga (muerte perezosa) sin archivo y con aviso. Devuelve
+    [(i, mini_mp4)] de los que si generan."""
+    Wd, Hd = _tam_video(seg_mp4)
+    vivos = []
+    for i in range(ID_N):
+        if not ID_ACT[i]:
+            continue
+        trk = ID_TRK[i]
+        if not id_valido(ID_NFR[i]):
+            ID_ACT[i] = False
+            print(f"    id={trk}: {ID_NFR[i]}f <60: descartado (sin archivo)")
+            continue
+        try:
+            cajas = ID_CAJAS[i]
+            f0 = min(c[0] for c in cajas)
+            f1 = max(c[0] for c in cajas)
+            x0 = min(c[1] for c in cajas)
+            y0 = min(c[2] for c in cajas)
+            x1 = max(c[3] for c in cajas)
+            y1 = max(c[4] for c in cajas)
+            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+            hw = max((x1 - x0) * MARGEN_TRACKLET / 2, 32)
+            hh = max((y1 - y0) * MARGEN_TRACKLET / 2, 32)
+            ax = max(int(cx - hw), 0)
+            ay = max(int(cy - hh), 0)
+            bx = min(int(cx + hw), Wd)
+            by = min(int(cy + hh), Hd)
+            ax -= ax % 2
+            ay -= ay % 2
+            bw = (bx - ax) // 2 * 2
+            bh = (by - ay) // 2 * 2
+            if bw < 16 or bh < 16:
+                raise RuntimeError(f"recorte degenerado {bw}x{bh}")
+            out = f"{segdir}/{nm}_id{trk}.mp4"
+            t0, t1 = f0 / FPS, (f1 + 1) / FPS
+            sh(f"ffmpeg -y -v error -ss {t0:.3f} -to {t1:.3f} -i \"{seg_mp4}\" "
+               f"-vf \"crop={bw}:{bh}:{ax}:{ay},setsar=1,fps=30\" -r 30 "
+               f"-c:v libx264 -pix_fmt yuv420p -crf 18 -an \"{out}\"",
+               check=True)
+            ok, _ = v_mp4(out)
+            if not ok:
+                raise RuntimeError("tracklet ilegible tras corte")
+            print(f"    id={trk}: TRACKLET-OK {ID_NFR[i]}f -> {out}")
+            vivos.append((i, out))
+        except Exception as e:
+            ID_ACT[i] = False
+            print(f"    id={trk}: tracklet FAIL "
+                  f"({type(e).__name__}: {str(e)[:100]}), apagado")
+    return vivos
+
+
+def ley_piso(d, video_mp4, moge):
+    """Ley PISO por ID: plano MoGe-2 en frame medio + correccion por
+    tobillos (misma matematica del pipeline ganador). Total: si algo
+    falla devuelve ['piso=omitido:...'] y delta=0, nunca revienta."""
+    import torch
+    import numpy as np
     try:
         import cv2
-        tiles = []
-        for nm, _, _ in kept:
-            cap = cv2.VideoCapture(f"{segdir}/{nm}.mp4")
-            cap.set(1, int(cap.get(7)) // 2)
-            ok, img = cap.read()
-            cap.release()
-            img = cv2.resize(img, (320, 568))
-            cv2.imwrite(f"{segdir}/{nm}_mid.jpg", img)
-            tiles.append(img)
-        rows = [cv2.hconcat(tiles[i:i + 5]) for i in range(0, len(tiles), 5)]
-        wmax = max(r.shape[1] for r in rows)
-        rows = [cv2.copyMakeBorder(r, 0, 0, 0, wmax - r.shape[1],
-                                   cv2.BORDER_CONSTANT) for r in rows]
-        cv2.imwrite(f"{segdir}/contact_sheet.jpg", cv2.vconcat(rows))
-        print("  SHEET-OK")
+        from sklearn.linear_model import RANSACRegressor
+        g = d["smpl_params_global"]
+        n = g["body_pose"].shape[0]
+        cap = cv2.VideoCapture(video_mp4)
+        total = int(cap.get(7) or 1)
+        cap.set(1, total // 2)
+        ok, img = cap.read()
+        cap.release()
+        if not ok or img is None:
+            raise RuntimeError("sin frame medio")
+        tt = torch.from_numpy(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                              ).permute(2, 0, 1).float().cuda() / 255
+        out = moge.infer(tt[None])
+        P = out["points"][0].cpu().numpy()
+        N = out["normal"][0].cpu().numpy()
+        M = out["mask"][0].cpu().numpy() > 0
+        H, Wd, _ = P.shape
+        ys, xs = np.mgrid[0:H, 0:Wd]
+        cand = M & (ys > H * 0.45) & (np.abs(N[..., 1]) > 0.9)
+        cand[:, Wd // 3:2 * Wd // 3] = False
+        pts = P[cand].reshape(-1, 3)
+        pts = pts[np.isfinite(pts).all(1)]
+        reg = RANSACRegressor(min_samples=3, residual_threshold=0.05,
+                              max_trials=500).fit(pts[:, :2], pts[:, 2])
+        a, b = reg.estimator_.coef_
+        c = float(reg.estimator_.intercept_)
+        nv = np.array([-a, -b, 1])
+        nv /= np.linalg.norm(nv)
+        d0 = -c * nv[2]
+        inl = int(reg.inlier_mask_.sum())
+        pct = 100 * inl / len(pts)
+        rep = [f"plano: pts={len(pts)} inl={pct:.0f}%"]
+        k2 = d["kp2d"]
+        k2 = k2.numpy() if torch.is_tensor(k2) else k2
+        mid = n // 2
+        ank = []
+        for j, lab in [(15, "L"), (16, "R")]:
+            x, y, cf = [float(v) for v in k2[mid, j]]
+            if cf < 0.3:
+                ank.append((lab, cf, None, None))
+                continue
+            u0 = min(max(int(x), 0), Wd - 1)
+            v0 = min(max(int(y), 0), H - 1)
+            win = []
+            for dv in range(-3, 4):
+                for du in range(-3, 4):
+                    uu = min(max(u0 + du, 0), Wd - 1)
+                    vv = min(max(v0 + dv, 0), H - 1)
+                    win.append(float(nv @ P[vv, uu] + d0))
+            win = np.array(win)
+            ank.append((lab, cf, float(np.median(win)), float(win.std())))
+        tp = []
+        for lab, cf, med, std in ank:
+            ms = "x" if med is None else str(round(med, 3))
+            ss = "x" if std is None else str(round(std, 3))
+            tp.append(lab + " cf=" + str(round(cf, 2)) + " med=" + ms
+                      + " std=" + ss)
+        rep.append("tobillos: " + " ".join(tp))
+        ok = [(lab, med, std) for lab, cf, med, std in ank
+              if med is not None and std is not None and std <= 0.06]
+        flags = []
+        if pct < 30:
+            flags.append("WARN:inliers<30")
+        if not ok:
+            flags.append("WARN:ambos-std>6")
+        if ok:
+            lab, med, std = sorted(ok, key=lambda z: z[2])[0]
+            delta = med - 0.10
+            if abs(delta) > 0.10:
+                flags.append("WARN:delta>10cm")
+            g["transl"][:, 1] -= float(delta)
+            sgn = "+" if delta >= 0 else ""
+            rep.append(f"delta={sgn}{round(delta, 4)}m (pie {lab}) CORREGIDO")
+        else:
+            rep.append("delta=0 (SIN corregir: velocidad anotada)")
+        rep.append("FLAGS: " + (" ".join(flags) if flags else "OK"))
+        return rep
     except Exception as e:
-        print(f"  (sheet opcional fallo: {e})")
-    return segdir, [k[0] for k in kept]
+        return [f"piso=omitido:{type(e).__name__}:{str(e)[:100]}"]
 
 
 # ------------------------------------------------------------------- LOTE
@@ -684,13 +970,10 @@ def escribir_bvh(d, bvh_path):
     with open(bvh_path, "w") as f:
         f.write("\n".join(lines) + "\n")
 def fase_lote(vid, fmm, segdir, segs):
-    phase("[4/4] LOTE (piso MoGe-2 -> SOLO BVH)")
+    phase("[4/4] LOTE-MULTI (TRACK->TRACKLET->POSE/PISO/EXPORT por ID->SOLO BVH)")
     import torch
-    import numpy as np
     if not torch.cuda.is_available():
         raise SystemExit("*** SIN GPU: activa acelerador (Settings -> Accelerator -> GPU) ***")
-    import cv2
-    from sklearn.linear_model import RANSACRegressor
     # Shim embebido (ver arriba): MoGe lo busca PRIMERO.
     _shim_ensure_utils3d()
     from moge.model.v2 import MoGeModel
@@ -705,132 +988,70 @@ def fase_lote(vid, fmm, segdir, segs):
     for nm in segs:
         R = f"{res}/{nm}"
         os.makedirs(R, exist_ok=True)
-        rep = [f"VID={vid} SEG={nm}"]
         try:
-            if os.path.exists(f"{R}/{nm}_corrected.pt"):
-                print(f"  {nm}: YA HECHO (regenero BVH del .pt)")
-                d = torch.load(f"{R}/{nm}_corrected.pt", map_location="cpu")
-                bvh = f"{W}/{vid}_{nm}.bvh"
-                escribir_bvh(d, bvh)
-                bvhs.append(bvh)
-                print(f"  {nm}: BVH-OK -> {bvh}")
-                continue
             seg = f"{segdir}/{nm}.mp4"
             if not os.path.exists(seg):
                 raise RuntimeError(f"no existe segmento: {seg}")
-            pr = subprocess.run(
-                f"ffprobe -v error -select_streams v:0 -show_entries stream=width,height "
-                f"-of csv=p=0 \"{seg}\"", shell=True, capture_output=True, text=True)
-            nums = re.findall(r"\d+", pr.stdout or "")
-            if len(nums) < 2:
-                raise RuntimeError(
-                    f"ffprobe vacio para {seg} (rc={pr.returncode}): "
-                    f"{(pr.stderr or '')[-300:]}")
-            ww, hh = int(nums[0]), int(nums[1])
+            ww, hh = _tam_video(seg)
             vf = "scale=1280:720" if ww > hh else "scale=720:1280"
             norm = f"{segdir}/{nm}_30fps.mp4"
             sh(f"ffmpeg -y -v error -i \"{seg}\" -vf \"{vf}:flags=lanczos,setsar=1,fps=30\" "
                f"-r 30 -c:v libx264 -pix_fmt yuv420p -crf 18 -an \"{norm}\"", check=True)
-            odir_vid = f"{OUT}/{vid}_{nm}_30fps"
-            odir_stm = f"{OUT}/{nm}_30fps"
-            sh(f"rm -rf {odir_vid} {odir_stm}")
-            t0 = datetime.datetime.now().timestamp()
-            # Tabla, no ramas: se prueba cada detector en orden, gana el 1ro OK.
-            r = None
-            for intento in INTENTOS_DETECTOR:
-                fl = intento["flags"]
-                r = sh(f"gvhmr demo \"{norm}\" -o {OUT} -s --f-mm {fmm} "
-                       f"{fl} --no-render")
-                if r.returncode == 0:
-                    print(f"  detector: {intento['nombre']}")
-                    break
-                print(f"  detector {intento['nombre']} fallo "
-                      f"(rc={r.returncode}), siguiente...")
-            if r.returncode != 0:
-                raise RuntimeError(
-                    "gvhmr fallo rc=%d cola=%s" %
-                    (r.returncode,
-                     (r.stderr or r.stdout or "")[-500:]))
-            # El .pt se describe (que trae) y se busca donde este.
-            pt = buscar_pt(t0, odir_vid, odir_stm)
-            rep.append(f"pt={pt}")
-            d = torch.load(pt, map_location="cpu")
-            g = d["smpl_params_global"]
-            n = g["body_pose"].shape[0]
-            rep.append(f"frames={n}")
-            key = f"{R}/{nm}_key.jpg"
-            sh(f"ffmpeg -y -v error -ss {n/60:.2f} -i \"{norm}\" -frames:v 1 {key}", check=True)
-            img = cv2.imread(key)
-            tt = torch.from_numpy(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                                  ).permute(2, 0, 1).float().cuda() / 255
-            out = moge.infer(tt[None])
-            P = out["points"][0].cpu().numpy()
-            N = out["normal"][0].cpu().numpy()
-            M = out["mask"][0].cpu().numpy() > 0
-            H, Wd, _ = P.shape
-            ys, xs = np.mgrid[0:H, 0:Wd]
-            cand = M & (ys > H * 0.45) & (np.abs(N[..., 1]) > 0.9)
-            cand[:, Wd // 3:2 * Wd // 3] = False
-            pts = P[cand].reshape(-1, 3)
-            pts = pts[np.isfinite(pts).all(1)]
-            reg = RANSACRegressor(min_samples=3, residual_threshold=0.05,
-                                  max_trials=500).fit(pts[:, :2], pts[:, 2])
-            a, b = reg.estimator_.coef_
-            c = float(reg.estimator_.intercept_)
-            nv = np.array([-a, -b, 1])
-            nv /= np.linalg.norm(nv)
-            d0 = -c * nv[2]
-            inl = int(reg.inlier_mask_.sum())
-            pct = 100 * inl / len(pts)
-            rep.append(f"plano: pts={len(pts)} inl={pct:.0f}%")
-            k2 = d["kp2d"]
-            k2 = k2.numpy() if torch.is_tensor(k2) else k2
-            mid = n // 2
-            ank = []
-            for j, lab in [(15, "L"), (16, "R")]:
-                x, y, cf = [float(v) for v in k2[mid, j]]
-                if cf < 0.3:
-                    ank.append((lab, cf, None, None))
-                    continue
-                u0 = min(max(int(x), 0), Wd - 1)
-                v0 = min(max(int(y), 0), H - 1)
-                win = []
-                for dv in range(-3, 4):
-                    for du in range(-3, 4):
-                        uu = min(max(u0 + du, 0), Wd - 1)
-                        vv = min(max(v0 + dv, 0), H - 1)
-                        win.append(float(nv @ P[vv, uu] + d0))
-                win = np.array(win)
-                ank.append((lab, cf, float(np.median(win)), float(win.std())))
-            tp = []
-            for lab, cf, med, std in ank:
-                ms = "x" if med is None else str(round(med, 3))
-                ss = "x" if std is None else str(round(std, 3))
-                tp.append(lab + " cf=" + str(round(cf, 2)) + " med=" + ms + " std=" + ss)
-            rep.append("tobillos: " + " ".join(tp))
-            ok = [(lab, med, std) for lab, cf, med, std in ank
-                  if med is not None and std is not None and std <= 0.06]
-            flags = []
-            if pct < 30:
-                flags.append("WARN:inliers<30")
-            if not ok:
-                flags.append("WARN:ambos-std>6")
-            if ok:
-                lab, med, std = sorted(ok, key=lambda z: z[2])[0]
-                delta = med - 0.10
-                if abs(delta) > 0.10:
-                    flags.append("WARN:delta>10cm")
-                g["transl"][:, 1] -= float(delta)
-                sgn = "+" if delta >= 0 else ""
-                rep.append(f"delta={sgn}{round(delta, 4)}m (pie {lab}) CORREGIDO")
-            else:
-                rep.append("delta=0 (SIN corregir: velocidad anotada)")
-            rep.append("FLAGS: " + (" ".join(flags) if flags else "OK"))
-            torch.save(d, f"{R}/{nm}_corrected.pt")
-            bvh = f"{W}/{vid}_{nm}.bvh"
-            escribir_bvh(d, bvh)
-            bvhs.append(bvh)
-            print(f"  {nm}: BVH-OK frames={n} -> {bvh}  <-- baja con 1 clic")
+            # Leyes en orden: TRACK llena IDS[10], TRACKLET recorta por ID,
+            # POSE/PISO/EXPORT corren por ID. Un ID falla solo, los demas siguen.
+            n_ids = ley_trackear(norm)
+            if n_ids == 0:
+                print(f"  {nm}: VACIO (0 personas), sigue")
+                continue
+            vivos = ley_tracklets(norm, segdir, nm)
+            for i, tracklet in vivos:
+                trk = ID_TRK[i]
+                tag = f"{nm}_id{trk}"
+                try:
+                    corr = f"{R}/{tag}_corrected.pt"
+                    if os.path.exists(corr):
+                        print(f"    id={trk}: YA HECHO (regenero BVH del .pt)")
+                        d = torch.load(corr, map_location="cpu")
+                        n = d["smpl_params_global"]["body_pose"].shape[0]
+                        bvh = f"{W}/{vid}_{tag}_{n}f.bvh"
+                        escribir_bvh(d, bvh)
+                        bvhs.append(bvh)
+                        print(f"    id={trk}: BVH-OK -> {bvh}")
+                        continue
+                    odir = f"{OUT}/{os.path.splitext(os.path.basename(tracklet))[0]}"
+                    sh(f"rm -rf {odir}")
+                    t0 = datetime.datetime.now().timestamp()
+                    # Tabla, no ramas: se prueba cada detector en orden, gana el 1ro OK.
+                    r = None
+                    for intento in INTENTOS_DETECTOR:
+                        fl = intento["flags"]
+                        r = sh(f"gvhmr demo \"{tracklet}\" -o {OUT} -s --f-mm {fmm} "
+                               f"{fl} --no-render")
+                        if r.returncode == 0:
+                            print(f"    id={trk} detector: {intento['nombre']}")
+                            break
+                        print(f"    id={trk} detector {intento['nombre']} fallo "
+                              f"(rc={r.returncode}), siguiente...")
+                    if r.returncode != 0:
+                        raise RuntimeError(
+                            "gvhmr fallo rc=%d cola=%s" %
+                            (r.returncode,
+                             (r.stderr or r.stdout or "")[-500:]))
+                    # El .pt se describe (que trae) y se busca donde este.
+                    pt = buscar_pt(t0, odir, odir)
+                    d = torch.load(pt, map_location="cpu")
+                    n = d["smpl_params_global"]["body_pose"].shape[0]
+                    for linea in ley_piso(d, tracklet, moge):
+                        print(f"    id={trk}: {linea}")
+                    torch.save(d, corr)
+                    bvh = f"{W}/{vid}_{tag}_{n}f.bvh"
+                    escribir_bvh(d, bvh)
+                    bvhs.append(bvh)
+                    print(f"    id={trk}: BVH-OK frames={n} -> {bvh}  <-- baja con 1 clic")
+                except Exception as e:
+                    ID_ACT[i] = False
+                    print(f"    id={trk}: FAIL {type(e).__name__}: "
+                          f"{str(e)[:200]} (los demas siguen)")
         except Exception as e:
             print(f"  {nm}: FAIL {type(e).__name__}: {str(e)[:300]}")
     print(f"  LOTE FIN: {len(bvhs)} BVH en {W}/")
@@ -839,7 +1060,7 @@ def fase_lote(vid, fmm, segdir, segs):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    print("== PIPELINE GANADOR seg01 | GVHMR preciso + piso MoGe-2 ==")
+    print("== PIPELINE MULTI | 1 video -> N personas -> N BVH (piso MoGe-2) ==")
     if argv[:1] == ["--instalar"]:
         fase_modelos()
         print("MODELOS-OK (instalacion completa, nada mas que hacer aqui)")
