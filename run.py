@@ -263,7 +263,7 @@ def fase_modelos():
            "local_dir='./moge/moge-2-vitb-normal')\" 2>&1 | tail -1")
     sh(f"export GVHMR_BODY_MODELS={BM}; gvhmr info 2>&1 | grep -iE 'smplx|smpl |yolo|hmr2'")
     assert os.path.exists(MOGE), "*** MoGe no se descargo ***"
-    # Verificacion real: probar los 4 imports que el LOTE necesita.
+    # BLINDAJE TOTAL: probar los 8 imports + 4 comandos que el pipeline usa.
     # Si algo va a fallar, falla AQUI con nombre y apellido, no a mitad del LOTE.
     _shim_ensure_utils3d()
     _ffdir = os.path.dirname(os.path.abspath(__file__))
@@ -273,6 +273,10 @@ def fase_modelos():
              f"import sys; sys.path.insert(0, '{_ffdir}'); "
              "import run as R; R._shim_ensure_utils3d(); "
              "from moge.model.v2 import MoGeModel"),
+            ("torch", "import torch"),
+            ("numpy", "import numpy"),
+            ("scipy", "from scipy.spatial.transform import Rotation"),
+            ("smplx", "import smplx"),
             ("sklearn", "from sklearn.linear_model import RANSACRegressor"),
             ("cv2", "import cv2"),
             ("huggingface_hub", "import huggingface_hub")]:
@@ -282,11 +286,28 @@ def fase_modelos():
             print(f"  VERIFY {nombre}: OK")
         else:
             print(f"  VERIFY {nombre}: FALTA")
+            print(f"    -> {r.stderr.strip().splitlines()[-1] if r.stderr.strip() else '?'}")
             faltan.append(nombre)
+    for cmd in ["ffmpeg", "ffprobe", "gvhmr", "scenedetect"]:
+        if shutil.which(cmd):
+            print(f"  VERIFY cmd-{cmd}: OK")
+        else:
+            print(f"  VERIFY cmd-{cmd}: FALTA")
+            faltan.append(f"cmd-{cmd}")
+    try:
+        r = subprocess.run("python3 -c \"import torch; "
+                           "print('OK-cuda' if torch.cuda.is_available() "
+                           "else 'SIN-CUDA')\"",
+                           shell=True, capture_output=True, text=True)
+        print(f"  VERIFY cuda: {r.stdout.strip() or 'FALTA'}")
+        if "OK-cuda" not in r.stdout:
+            faltan.append("cuda-GPU")
+    except Exception:
+        faltan.append("cuda-GPU")
     if faltan:
         raise SystemExit(f"*** INSTALAR INCOMPLETO, falta: {faltan}. "
                          "Re-corre esta celda ***")
-    print("  MODELOS-OK")
+    print("  MODELOS-OK (todo importado y verificado)")
 
 
 # --------------------------------------------------------------- VIDEO-IN
