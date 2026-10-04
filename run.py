@@ -2,9 +2,11 @@
 """Pipeline seg01: GVHMR + piso MoGe-2. Uso:
     !python3 ff/run.py --instalar   (solo modelos)
     VID = 'nombre'                   (celda aparte)
-    !python3 ff/run.py $VID          (todo -> zip en Resultados/)
+    !python3 ff/run.py $VID          (todo -> SOLO BVH en /kaggle/working/)
 Receta: -s, --f-mm 24, --no-render, PySceneDetect -t 27, MoGe-2 vitb,
-tobillos 7x7, std>6cm = descartado. Sin report OK no va a BVH.
+tobillos 7x7, std>6cm = descartado. Salida: {VID}_{seg}.bvh y nada mas.
+EDOD: ningun path se asume. Todo se DESCRIBE (nombre + candidatos +
+validador por contenido) y la ley resolver() lo encuentra donde este.
 SMPLX via API (Secrets); resto publico. Sin secretos ni pesos adentro.
 """
 import csv
@@ -12,6 +14,7 @@ import datetime
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -44,6 +47,156 @@ def need(path, what):
     ok = os.path.exists(path)
     print(f"  [{'OK' if ok else '--'}] {what}: {path}")
     return ok
+
+
+# --------------------------------------- DESCRIBIR LO QUE EXISTE (EDOD)
+# No se asume DONDE estan las cosas. Se declara QUE existe:
+#   (nombre + candidatos + validador por CONTENIDO)
+# y UNA sola ley las resuelve todas. Un cambio futuro = una fila,
+# nunca diez lineas acopladas. Sin clases, sin self: datos + leyes.
+HALLADO = {}
+
+
+def resolver(nombre, candidatos, valida, ayuda, clave=None, reversa=False):
+    """Ley universal de descubrimiento: recorre candidatos (globs),
+    valida por CONTENIDO (no por nombre) y devuelve el primero valido.
+    Si nada existe, error con la lista exacta de donde busco."""
+    vistos = []
+    for patron in candidatos:
+        vistos.extend(sorted(glob.glob(patron, recursive=True)))
+    if clave is not None:
+        try:
+            vistos = sorted(vistos, key=clave, reverse=reversa)
+        except Exception:
+            pass
+    for p in vistos:
+        try:
+            ok, detalle = valida(p)
+        except Exception as e:
+            ok, detalle = False, f"validador-fallo:{str(e)[:60]}"
+        if ok:
+            print(f"  [ENCONTRADO] {nombre}: {p} ({detalle})")
+            HALLADO[nombre] = p
+            return p
+    donde = vistos if vistos else candidatos
+    raise SystemExit(f"*** NO EXISTE {nombre}. Busque en: {donde}. {ayuda} ***")
+
+
+def _mb(p):
+    try:
+        return f"{os.path.getsize(p) / 1e6:.0f}MB"
+    except Exception:
+        return "?"
+
+
+def v_npz(p):
+    ok = p.endswith(".npz") and os.path.isfile(p) \
+        and os.path.getsize(p) > 1000000
+    return (ok, _mb(p))
+
+
+def v_moge(p):
+    ok = p.endswith("model.pt") and os.path.isfile(p) \
+        and os.path.getsize(p) > 10000000
+    return (ok, _mb(p))
+
+
+def v_mp4(p):
+    if not (os.path.isfile(p) and os.path.getsize(p) > 10000):
+        return (False, "vacio/ausente")
+    pr = subprocess.run(
+        f"ffprobe -v error -select_streams v:0 "
+        f"-show_entries stream=width,height -of csv=p=0 \"{p}\"",
+        shell=True, capture_output=True, text=True)
+    nums = re.findall(r"\d+", pr.stdout or "")
+    if len(nums) >= 2:
+        return (True, f"{nums[0]}x{nums[1]}")
+    return (False, f"ffprobe-vacio rc={pr.returncode}")
+
+
+def v_pt_gvhmr(p, t0=None):
+    if not (p.endswith(".pt") and os.path.isfile(p)):
+        return (False, "no-pt")
+    if t0 is not None:
+        try:
+            if os.path.getmtime(p) < t0 - 5:
+                return (False, "viejo")
+        except Exception:
+            return (False, "sin-fecha")
+    try:
+        import torch
+        d = torch.load(p, map_location="cpu")
+        if isinstance(d, dict) and "smpl_params_global" in d:
+            n = d["smpl_params_global"]["body_pose"].shape[0]
+            return (True, f"frames={n}")
+        return (False, "sin-smpl_params_global")
+    except Exception as e:
+        return (False, f"ilegible:{str(e)[:60]}")
+
+
+def buscar_smplx():
+    return resolver(
+        "SMPLX",
+        [f"{BM}/smplx/*.npz", f"{BM}/*.npz",
+         "./**/SMPLX_NEUTRAL.npz",
+         os.path.join(os.environ.get("HOME", "/root"),
+                      "**/SMPLX_NEUTRAL.npz")],
+        v_npz, "Re-corre --instalar (dataset smplx-neutral-npz).")
+
+
+def buscar_moge():
+    return resolver(
+        "MoGe-vitb",
+        [MOGE, f"{W}/moge/**/model.pt", "./moge/**/model.pt"],
+        v_moge, "Re-corre --instalar.")
+
+
+def buscar_video(vid):
+    return resolver(
+        f"VIDEO {vid}",
+        [f"{IN}/{vid}.mp4", f"/kaggle/input/**/{vid}.mp4",
+         f"./**/{vid}.mp4"],
+        v_mp4, "Adjunta el dataset o sube el .mp4 a inputs_demo/.")
+
+
+def buscar_pt(t0, odir_vid, odir_stm):
+    return resolver(
+        "PT-gvhmr",
+        [f"{odir_vid}/hmr4d_results.pt",
+         f"{odir_stm}/hmr4d_results.pt",
+         f"{OUT}/*/hmr4d_results.pt",
+         f"{OUT}/*/*/hmr4d_results.pt"],
+        lambda p: v_pt_gvhmr(p, t0),
+        "gvhmr rc=0 pero ningun .pt trae smpl_params_global.",
+        clave=os.path.getmtime, reversa=True)
+
+
+INTENTOS_DETECTOR = [
+    {"nombre": "yolo26x", "flags": "--detector yolo26x"},
+    {"nombre": "defecto-8x", "flags": ""},
+]
+
+
+def validar_entorno():
+    phase("[0] VALIDAR (ley previa: nada pesado corre sin esto)")
+    faltan = []
+    for cmd in ["ffmpeg", "ffprobe", "gvhmr", "scenedetect"]:
+        hay = shutil.which(cmd) is not None
+        print(f"  [{'OK' if hay else 'FALTA'}] cmd-{cmd}")
+        if not hay:
+            faltan.append(cmd)
+    try:
+        import torch
+        hay_gpu = torch.cuda.is_available()
+        print(f"  [{'OK' if hay_gpu else '--'}] cuda-GPU"
+              f" ({torch.cuda.get_device_name(0) if hay_gpu else 'sin-gpu'})")
+        if not hay_gpu:
+            faltan.append("cuda-GPU")
+    except Exception:
+        print("  [--] torch: aun no instalado (lo trae [1] MODELOS)")
+    if faltan:
+        raise SystemExit(f"*** ENTORNO INCOMPLETO, falta: {faltan}. "
+                         "Activa GPU o re-corre --instalar ***")
 
 
 # ------------------------------------------------------------------ SHIM
@@ -214,7 +367,7 @@ def _shim_ensure_utils3d():
 
 # ------------------------------------------------------------------ FASE 0
 def fase_modelos():
-    phase("[1/5] MODELOS (todo auto)")
+    phase("[1/4] MODELOS (todo auto)")
     os.makedirs(f"{BM}/smplx", exist_ok=True)
     os.makedirs(f"{BM}/smpl", exist_ok=True)
     os.makedirs(IN, exist_ok=True)
@@ -312,12 +465,21 @@ def fase_modelos():
 
 # --------------------------------------------------------------- VIDEO-IN
 def video_in():
-    phase("[2/5] VIDEO-IN (descubre .mp4, auto)")
+    phase("[2/4] VIDEO-IN (descubre .mp4, valida contenido)")
     found = subprocess.run("find /kaggle/input -type f -iname '*.mp4' 2>/dev/null",
                            shell=True, capture_output=True, text=True).stdout.split()
     for s in found:
         shutil.copy(s, IN)
     vids = sorted(s[:-4] for s in os.listdir(IN) if s.endswith(".mp4"))
+    # Ley: el mismo validador para todos, el corrupto se descarta con aviso.
+    buenos = []
+    for v in vids:
+        ok, detalle = v_mp4(f"{IN}/{v}.mp4")
+        if ok:
+            buenos.append(v)
+        else:
+            print(f"  [--] {v}.mp4 descartado ({detalle})")
+    vids = buenos
     if not vids:
         raise SystemExit("*** SIN VIDEO: adjunta tu dataset (Add Input) o sube el "
                          ".mp4 a inputs_demo/ y re-corre ***")
@@ -333,10 +495,11 @@ def pedir_vid(vids):
 
 # ------------------------------------------------------------------ SPLIT
 def fase_split(vid, t):
-    phase("[3/5] SPLIT (cortes, >=2s)")
+    phase("[3/4] SPLIT (cortes, >=2s)")
+    vpath = buscar_video(vid)
     segdir = f"{W}/segments_{vid}"
     os.makedirs(segdir, exist_ok=True)
-    sh(f"cd {W} && scenedetect -i inputs_demo/{vid}.mp4 detect-content -t {t} "
+    sh(f"cd {W} && scenedetect -i \"{vpath}\" detect-content -t {t} "
        f"list-scenes -o segments_{vid}/", check=False)
     csvp = f"{segdir}/{vid}-Scenes.csv"
     if not os.path.exists(csvp):
@@ -390,7 +553,7 @@ def fase_split(vid, t):
             continue
         nm = f"seg{len(kept) + 1:02d}"
         sh(f"ffmpeg -y -v error -ss {s0} -to {s1} "
-           f"-i {IN}/{vid}.mp4 -c copy {segdir}/{nm}.mp4", check=True)
+           f"-i \"{vpath}\" -c copy {segdir}/{nm}.mp4", check=True)
         kept.append((nm, s0, s1))
     if not kept:
         raise SystemExit("*** 0 SEGMENTOS >=2s: baja el umbral o revisa el video ***")
@@ -509,7 +672,7 @@ def escribir_bvh(d, bvh_path):
     with open(bvh_path, "w") as f:
         f.write("\n".join(lines) + "\n")
 def fase_lote(vid, fmm, segdir, segs):
-    phase("[4/5] LOTE (receta + piso + delta + depths + report)")
+    phase("[4/4] LOTE (piso MoGe-2 -> SOLO BVH)")
     import torch
     import numpy as np
     if not torch.cuda.is_available():
@@ -522,62 +685,69 @@ def fase_lote(vid, fmm, segdir, segs):
     res = f"{W}/Resultados/{vid}"
     os.makedirs(res, exist_ok=True)
     os.environ["GVHMR_BODY_MODELS"] = BM
+    # Sin SMPL-X no hay BVH: se busca donde este, no donde se supone.
+    buscar_smplx()
+    buscar_moge()
     moge = MoGeModel.from_pretrained(MOGE).cuda().eval()
-    index = []
+    bvhs = []
     for nm in segs:
         R = f"{res}/{nm}"
         os.makedirs(R, exist_ok=True)
         rep = [f"VID={vid} SEG={nm}"]
         try:
-            if os.path.exists(f"{R}/{nm}_corrected.pt") and os.path.exists(f"{R}/report.txt"):
-                print(f"  {nm}: YA HECHO (skip)")
-                index.append((nm, "YA-HECHO"))
+            if os.path.exists(f"{R}/{nm}_corrected.pt"):
+                print(f"  {nm}: YA HECHO (regenero BVH del .pt)")
+                d = torch.load(f"{R}/{nm}_corrected.pt", map_location="cpu")
+                bvh = f"{W}/{vid}_{nm}.bvh"
+                escribir_bvh(d, bvh)
+                bvhs.append(bvh)
+                print(f"  {nm}: BVH-OK -> {bvh}")
                 continue
             seg = f"{segdir}/{nm}.mp4"
-            probe = subprocess.run(
+            if not os.path.exists(seg):
+                raise RuntimeError(f"no existe segmento: {seg}")
+            pr = subprocess.run(
                 f"ffprobe -v error -select_streams v:0 -show_entries stream=width,height "
-                f"-of csv=p=0 {seg}", shell=True, capture_output=True, text=True).stdout.strip()
-            ww, hh = [int(x) for x in probe.split(",")]
+                f"-of csv=p=0 \"{seg}\"", shell=True, capture_output=True, text=True)
+            nums = re.findall(r"\d+", pr.stdout or "")
+            if len(nums) < 2:
+                raise RuntimeError(
+                    f"ffprobe vacio para {seg} (rc={pr.returncode}): "
+                    f"{(pr.stderr or '')[-300:]}")
+            ww, hh = int(nums[0]), int(nums[1])
             vf = "scale=1280:720" if ww > hh else "scale=720:1280"
             norm = f"{segdir}/{nm}_30fps.mp4"
-            sh(f"ffmpeg -y -v error -i {seg} -vf \"{vf}:flags=lanczos,setsar=1,fps=30\" "
-               f"-r 30 -c:v libx264 -pix_fmt yuv420p -crf 18 -an {norm}", check=True)
+            sh(f"ffmpeg -y -v error -i \"{seg}\" -vf \"{vf}:flags=lanczos,setsar=1,fps=30\" "
+               f"-r 30 -c:v libx264 -pix_fmt yuv420p -crf 18 -an \"{norm}\"", check=True)
             odir_vid = f"{OUT}/{vid}_{nm}_30fps"
             odir_stm = f"{OUT}/{nm}_30fps"
             sh(f"rm -rf {odir_vid} {odir_stm}")
             t0 = datetime.datetime.now().timestamp()
-            r = sh(f"gvhmr demo {norm} -o {OUT} -s --f-mm {fmm} --no-render")
+            # Tabla, no ramas: se prueba cada detector en orden, gana el 1ro OK.
+            r = None
+            for intento in INTENTOS_DETECTOR:
+                fl = intento["flags"]
+                r = sh(f"gvhmr demo \"{norm}\" -o {OUT} -s --f-mm {fmm} "
+                       f"{fl} --no-render")
+                if r.returncode == 0:
+                    print(f"  detector: {intento['nombre']}")
+                    break
+                print(f"  detector {intento['nombre']} fallo "
+                      f"(rc={r.returncode}), siguiente...")
             if r.returncode != 0:
                 raise RuntimeError(
                     "gvhmr fallo rc=%d cola=%s" %
                     (r.returncode,
                      (r.stderr or r.stdout or "")[-500:]))
-            pt = None
-            for cand in (f"{odir_vid}/hmr4d_results.pt",
-                         f"{odir_stm}/hmr4d_results.pt"):
-                if os.path.exists(cand):
-                    pt = cand
-                    break
-            if pt is None:
-                # Fallback: el .pt mas nuevo bajo OUT (creado por este gvhmr).
-                cands = sorted(glob.glob(f"{OUT}/*/hmr4d_results.pt"),
-                               key=os.path.getmtime)
-                cands = [c for c in cands
-                         if os.path.getmtime(c) >= t0 - 5]
-                pt = cands[-1] if cands else None
-            if pt is None:
-                raise RuntimeError(
-                    "sin .pt: gvhmr rc=0 pero no dejo hmr4d_results.pt "
-                    "ni en %s ni en %s; cola=%s" %
-                    (odir_vid, odir_stm,
-                     (r.stdout or "")[-500:]))
+            # El .pt se describe (que trae) y se busca donde este.
+            pt = buscar_pt(t0, odir_vid, odir_stm)
             rep.append(f"pt={pt}")
             d = torch.load(pt, map_location="cpu")
             g = d["smpl_params_global"]
             n = g["body_pose"].shape[0]
             rep.append(f"frames={n}")
             key = f"{R}/{nm}_key.jpg"
-            sh(f"ffmpeg -y -v error -ss {n/60:.2f} -i {norm} -frames:v 1 {key}", check=True)
+            sh(f"ffmpeg -y -v error -ss {n/60:.2f} -i \"{norm}\" -frames:v 1 {key}", check=True)
             img = cv2.imread(key)
             tt = torch.from_numpy(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                                   ).permute(2, 0, 1).float().cuda() / 255
@@ -645,61 +815,14 @@ def fase_lote(vid, fmm, segdir, segs):
                 rep.append("delta=0 (SIN corregir: velocidad anotada)")
             rep.append("FLAGS: " + (" ".join(flags) if flags else "OK"))
             torch.save(d, f"{R}/{nm}_corrected.pt")
-            escribir_bvh(d, f"{R}/{nm}.bvh")
-            rep.append(f"bvh={nm}.bvh")
-            bb = d["bbx_xys"]
-            bb = (bb.numpy() if torch.is_tensor(bb) else bb).astype(float)
-            cap = cv2.VideoCapture(norm)
-            deps = []
-            step = max(1, n // 11)
-            for f_ in range(0, n, step)[:11]:
-                cap.set(1, f_)
-                okf, im = cap.read()
-                if not okf:
-                    break
-                cx, cy, s = bb[min(f_, n - 1)]
-                side = s * 200 * 0.5
-                x0 = int(max(cx - side / 2, 0))
-                y0 = int(max(cy - side / 2, 0))
-                x1 = int(min(cx + side / 2, im.shape[1]))
-                y1 = int(min(cy + side / 2, im.shape[0]))
-                crop = im[y0:y1, x0:x1]
-                t2 = torch.from_numpy(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-                                      ).permute(2, 0, 1).float().cuda() / 255
-                dd = moge.infer(t2[None])["depth"].cpu().numpy()[0]
-                h, w = dd.shape
-                core = dd[h // 4:3 * h // 4, w // 4:3 * w // 4]
-                deps.append(float(np.median(core)))
-            cap.release()
-            np.savetxt(f"{R}/{nm}_torso_depth.txt", np.array(deps), fmt="%.4f")
-            rep.append(f"depths[{len(deps)}]")
-            with open(f"{R}/report.txt", "w") as f:
-                f.write("\n".join(rep) + "\n")
-            index.append((nm, rep[-2]))
-            print(f"  {nm}: OK frames={n} {rep[-2]}")
+            bvh = f"{W}/{vid}_{nm}.bvh"
+            escribir_bvh(d, bvh)
+            bvhs.append(bvh)
+            print(f"  {nm}: BVH-OK frames={n} -> {bvh}  <-- baja con 1 clic")
         except Exception as e:
-            with open(f"{R}/report.txt", "w") as f:
-                f.write("\n".join(rep) + f"\nFAIL: {type(e).__name__}: {str(e)[:300]}\n")
-            index.append((nm, "FAIL"))
-            print(f"  {nm}: FAIL {str(e)[:200]}")
-    with open(f"{res}/index.csv", "w") as f:
-        f.write("\n".join(a + ";" + b for a, b in index))
-    print(f"  LOTE FIN: {len(index)} segmentos -> {res}")
-    return res
-
-
-# -------------------------------------------------------------------- ZIP
-def fase_zip(vid):
-    phase("[5/5] ZIP (SOLO el zip vive en Resultados/)")
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-    zf = f"{W}/Resultados/LOTE_{vid}_{ts}.zip"
-    sh(f"cd {W} && rm -f Resultados/LOTE_{vid}_*.zip && zip -r {zf} "
-       f"Resultados/{vid} segments_{vid}/contact_sheet.jpg "
-       f"segments_{vid}/{vid}-Scenes.csv "
-       "-x '*/mesh*' '*/camera*' '*preprocess*' '*0_input_video*' "
-       "'*_geo.pt' '*_30fps.mp4' '*_mid.jpg' 2>&1 | tail -2")
-    sh(f"ls -lh {W}/Resultados/")
-    print(f"  ZIP-OK: {zf}  <-- baja este archivo con 1 clic")
+            print(f"  {nm}: FAIL {type(e).__name__}: {str(e)[:300]}")
+    print(f"  LOTE FIN: {len(bvhs)} BVH en {W}/")
+    return bvhs
 
 
 def main(argv=None):
@@ -727,16 +850,16 @@ def main(argv=None):
     except Exception:
         t = T_DEFAULT
     print(f"VID={vid} FMM={fmm} T={t} (argv; sin prompts)")
+    validar_entorno()
     fase_modelos()
     vids = video_in()
     if vid not in vids:
         raise SystemExit(f"*** VID '{vid}' no esta en inputs_demo/. Opciones: "
                          f"{', '.join(vids)} (revisa letra por letra) ***")
     segdir, segs = fase_split(vid, t)
-    res = fase_lote(vid, fmm, segdir, segs)
-    fase_zip(vid)
-    print(f"\nFIN: revisa {res}/index.csv (FLAGS por segmento). "
-          "Sin report OK no va a BVH.")
+    bvhs = fase_lote(vid, fmm, segdir, segs)
+    print(f"\nFIN: {len(bvhs)} BVH en /kaggle/working/ (baja con 1 clic). "
+          "Piso ya horneado; en local pasales limpiar_bvh.py para in-place.")
 
 
 if __name__ == "__main__":
