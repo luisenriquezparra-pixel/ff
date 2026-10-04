@@ -27,6 +27,8 @@ MOGE = f"{W}/moge/moge-2-vitb-normal/model.pt"
 FMM_DEFAULT = 24
 T_DEFAULT = 27
 FPS = 30
+MAX_IDS = 10
+MIN_FRAMES = 60
 
 
 def sh(cmd, tail=3, check=False):
@@ -41,6 +43,16 @@ def sh(cmd, tail=3, check=False):
 
 def phase(msg):
     print(f"\n===== {msg} =====")
+
+
+def id_valido(n_frames):
+    """Ley de 2 segundos: solo la racha con >=MIN_FRAMES genera BVH.
+    Pregunta por la propiedad frames, nunca por identidad. Lo demas
+    se descarta con aviso y no genera ningun archivo."""
+    try:
+        return int(n_frames) >= MIN_FRAMES
+    except Exception:
+        return False
 
 
 def need(path, what):
