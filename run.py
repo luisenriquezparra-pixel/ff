@@ -542,12 +542,36 @@ def fase_lote(vid, fmm, segdir, segs):
             norm = f"{segdir}/{nm}_30fps.mp4"
             sh(f"ffmpeg -y -v error -i {seg} -vf \"{vf}:flags=lanczos,setsar=1,fps=30\" "
                f"-r 30 -c:v libx264 -pix_fmt yuv420p -crf 18 -an {norm}", check=True)
-            odir = f"{OUT}/{vid}_{nm}_30fps"
-            sh(f"rm -rf {odir}")
+            odir_vid = f"{OUT}/{vid}_{nm}_30fps"
+            odir_stm = f"{OUT}/{nm}_30fps"
+            sh(f"rm -rf {odir_vid} {odir_stm}")
+            t0 = datetime.datetime.now().timestamp()
             r = sh(f"gvhmr demo {norm} -o {OUT} -s --f-mm {fmm} --no-render")
-            pt = f"{odir}/hmr4d_results.pt"
-            if not os.path.exists(pt):
-                raise RuntimeError("sin .pt")
+            if r.returncode != 0:
+                raise RuntimeError(
+                    "gvhmr fallo rc=%d cola=%s" %
+                    (r.returncode,
+                     (r.stderr or r.stdout or "")[-500:]))
+            pt = None
+            for cand in (f"{odir_vid}/hmr4d_results.pt",
+                         f"{odir_stm}/hmr4d_results.pt"):
+                if os.path.exists(cand):
+                    pt = cand
+                    break
+            if pt is None:
+                # Fallback: el .pt mas nuevo bajo OUT (creado por este gvhmr).
+                cands = sorted(glob.glob(f"{OUT}/*/hmr4d_results.pt"),
+                               key=os.path.getmtime)
+                cands = [c for c in cands
+                         if os.path.getmtime(c) >= t0 - 5]
+                pt = cands[-1] if cands else None
+            if pt is None:
+                raise RuntimeError(
+                    "sin .pt: gvhmr rc=0 pero no dejo hmr4d_results.pt "
+                    "ni en %s ni en %s; cola=%s" %
+                    (odir_vid, odir_stm,
+                     (r.stdout or "")[-500:]))
+            rep.append(f"pt={pt}")
             d = torch.load(pt, map_location="cpu")
             g = d["smpl_params_global"]
             n = g["body_pose"].shape[0]
