@@ -46,6 +46,172 @@ def need(path, what):
     return ok
 
 
+# ------------------------------------------------------------------ SHIM
+# utils3d_moge EMBEBIDO (todo dentro de este run.py, cero archivos extra).
+# Replica exacta (MIT, EasternJournalist/utils3d) de lo unico que MoGe usa
+# en inferencia. MoGe lo busca PRIMERO (try import utils3d_moge), asi no
+# choca con nada real. Puro torch: sin open3d, sin pip imposible.
+def _shim_ensure_utils3d():
+    try:
+        import utils3d_moge  # noqa: F401 (si existe de verdad, se usa)
+        return
+    except ImportError:
+        pass
+    import torch
+    import torch.nn.functional as _F
+    from itertools import chain as _chain
+    from numbers import Integral as _Integral
+    import types as _types
+
+    def _sliding_window(x, window_size, stride=None, dilation=None,
+                        pad_size=None, pad_mode='constant', pad_value=0,
+                        dim=None):
+        if dim is None:
+            dim = tuple(range(x.ndim))
+        if isinstance(dim, _Integral):
+            dim = (dim,)
+        dim = [dim[i] % x.ndim for i in range(len(dim))]
+        if isinstance(window_size, _Integral):
+            window_size = (window_size,) * len(dim)
+        if stride is None:
+            stride = (1,) * len(dim)
+        elif isinstance(stride, _Integral):
+            stride = (stride,) * len(dim)
+        if dilation is None:
+            dilation = (1,) * len(dim)
+        elif isinstance(dilation, _Integral):
+            dilation = (dilation,) * len(dim)
+        assert len(window_size) == len(stride) == len(dim)
+        if pad_size is not None:
+            if isinstance(pad_size, _Integral):
+                pad_size = ((pad_size, pad_size),) * len(dim)
+            elif isinstance(pad_size, tuple) and len(pad_size) == 2 \
+                    and all(isinstance(p, _Integral) for p in pad_size):
+                pad_size = (pad_size,) * len(dim)
+            elif isinstance(pad_size, tuple) and all(
+                    isinstance(p, tuple) and 1 <= len(p) <= 2
+                    for p in pad_size):
+                pad_size = pad_size * len(dim) if len(pad_size) == 1 \
+                    else pad_size
+                assert len(pad_size) == len(dim)
+                pad_size = tuple(p * 2 if len(p) == 1 else p
+                                 for p in pad_size)
+            else:
+                raise ValueError(f"Invalid pad_size {pad_size}")
+            full_pad = [(0, 0) if i not in dim else pad_size[dim.index(i)]
+                        for i in range(x.ndim)]
+            x = _F.pad(x, tuple(_chain(*reversed(full_pad))),
+                       mode=pad_mode, value=pad_value)
+        for i in range(len(window_size)):
+            x = x.unfold(dim[i], (window_size[i] - 1) * dilation[i] + 1,
+                         stride[i])[..., ::dilation[i]]
+        return x
+
+    def _uv_map(height, width=None, top=0., left=0., bottom=1., right=1.,
+                dtype=torch.float32, device=None):
+        if isinstance(height, tuple):
+            height, width = height
+        u = torch.linspace(left + 0.5 / width * (right - left),
+                           right - 0.5 / width * (right - left),
+                           width, dtype=dtype, device=device)
+        v = torch.linspace(top + 0.5 / height * (bottom - top),
+                           bottom - 0.5 / height * (bottom - top),
+                           height, dtype=dtype, device=device)
+        return torch.stack(torch.meshgrid(u, v, indexing='xy'), dim=-1)
+
+    def _pixel_coord_map(height, width=None, top=0, left=0,
+                         convention='integer-center',
+                         dtype=torch.float32, device=None):
+        if isinstance(height, tuple):
+            height, width = height
+        u = torch.arange(left, left + width, dtype=dtype, device=device)
+        v = torch.arange(top, top + height, dtype=dtype, device=device)
+        if convention == 'integer-corner':
+            u = u + 0.5
+            v = v + 0.5
+        u, v = torch.meshgrid(u, v, indexing='xy')
+        return torch.stack([u, v], dim=2)
+
+    def _masked_min(x, mask, dim=None, keepdim=False):
+        f = torch.where(mask, x, torch.tensor(torch.inf, dtype=x.dtype,
+                                              device=x.device))
+        return f.min() if dim is None else f.min(dim=dim, keepdim=keepdim)
+
+    def _masked_max(x, mask, dim=None, keepdim=False):
+        f = torch.where(mask, x, torch.tensor(-torch.inf, dtype=x.dtype,
+                                              device=x.device))
+        return f.max() if dim is None else f.max(dim=dim, keepdim=keepdim)
+
+    def _safe_inv(A):
+        inv, info = torch.linalg.inv_ex(A)
+        if info.any():
+            inv = torch.where((info > 0)[..., None, None],
+                              torch.full_like(inv, float('nan')), inv)
+        return inv
+
+    def _unproject_cv(uv, depth, intrinsics, extrinsics=None):
+        K = torch.cat([
+            torch.cat([intrinsics,
+                       torch.zeros((*intrinsics.shape[:-2], 3, 1),
+                                   dtype=intrinsics.dtype,
+                                   device=intrinsics.device)], dim=-1),
+            torch.tensor([[0, 0, 0, 1]], dtype=intrinsics.dtype,
+                         device=intrinsics.device).expand(
+                             *intrinsics.shape[:-2], 1, 4),
+        ], dim=-2)
+        transform = K @ extrinsics if extrinsics is not None else K
+        pts = torch.cat([uv, torch.ones((*uv.shape[:-1], 1),
+                                        dtype=uv.dtype,
+                                        device=uv.device)],
+                        dim=-1) * depth[..., None]
+        pts = torch.cat([pts, torch.ones((*pts.shape[:-1], 1),
+                                         dtype=uv.dtype,
+                                         device=uv.device)],
+                        dim=-1)
+        return (pts @ _safe_inv(transform).mT)[..., :3]
+
+    def _depth_map_to_point_map(depth, intrinsics, extrinsics=None):
+        height, width = depth.shape[-2:]
+        uv = _uv_map(height, width, dtype=depth.dtype, device=depth.device)
+        return _unproject_cv(uv, depth,
+                             intrinsics=intrinsics[..., None, :, :],
+                             extrinsics=extrinsics[..., None, :, :]
+                             if extrinsics is not None else None)
+
+    def _t(a, like):
+        if torch.is_tensor(a):
+            return a.to(device=like.device, dtype=like.dtype)
+        return torch.tensor(a, device=like.device, dtype=like.dtype)
+
+    def _intrinsics_from_focal_center(fx, fy, cx, cy):
+        like = fx if torch.is_tensor(fx) else fy if torch.is_tensor(fy) \
+            else cx if torch.is_tensor(cx) else cy
+        if not torch.is_tensor(like):
+            like = torch.tensor(0.0)
+        fx, fy, cx, cy = torch.broadcast_tensors(_t(fx, like), _t(fy, like),
+                                                 _t(cx, like), _t(cy, like))
+        zeros, ones = torch.zeros_like(fx), torch.ones_like(fx)
+        return torch.stack([fx, zeros, cx,
+                            zeros, fy, cy,
+                            zeros, zeros, ones],
+                           dim=-1).unflatten(-1, (3, 3))
+
+    class _PT:
+        sliding_window = staticmethod(_sliding_window)
+        uv_map = staticmethod(_uv_map)
+        pixel_coord_map = staticmethod(_pixel_coord_map)
+        masked_min = staticmethod(_masked_min)
+        masked_max = staticmethod(_masked_max)
+        unproject_cv = staticmethod(_unproject_cv)
+        depth_map_to_point_map = staticmethod(_depth_map_to_point_map)
+        intrinsics_from_focal_center = staticmethod(
+            _intrinsics_from_focal_center)
+
+    mod = _types.ModuleType("utils3d_moge")
+    mod.pt = _PT()
+    sys.modules["utils3d_moge"] = mod
+
+
 # ------------------------------------------------------------------ FASE 0
 def fase_modelos():
     phase("[1/5] MODELOS (todo auto)")
@@ -83,9 +249,12 @@ def fase_modelos():
         raise SystemExit("*** FALTA SMPLX: adjunta tu dataset smplx-neutral-npz "
                          "(Add Input) y re-corre. Nada mas que hacer a mano. ***")
 
-    sh("pip install \"gvhmr[preproc]\" \"scenedetect[opencv]\" huggingface_hub scipy 2>&1 | tail -1")
+    sh("pip install \"gvhmr[preproc]\" \"scenedetect[opencv]\" huggingface_hub scipy "
+       "scikit-learn 2>&1 | tail -1")
     if not os.path.exists(f"{W}/MoGe"):
         sh(f"git clone https://github.com/microsoft/MoGe.git {W}/MoGe 2>&1 | tail -1")
+    # El clone sin install era el hueco: el modulo `moge` debe importarse.
+    sh(f"pip install --no-deps {W}/MoGe 2>&1 | tail -1")
     os.environ["GVHMR_BODY_MODELS"] = BM
     sh(f"export GVHMR_BODY_MODELS={BM}; gvhmr download 2>&1 | tail -2")
     if not os.path.exists(MOGE):
@@ -94,6 +263,29 @@ def fase_modelos():
            "local_dir='./moge/moge-2-vitb-normal')\" 2>&1 | tail -1")
     sh(f"export GVHMR_BODY_MODELS={BM}; gvhmr info 2>&1 | grep -iE 'smplx|smpl |yolo|hmr2'")
     assert os.path.exists(MOGE), "*** MoGe no se descargo ***"
+    # Verificacion real: probar los 4 imports que el LOTE necesita.
+    # Si algo va a fallar, falla AQUI con nombre y apellido, no a mitad del LOTE.
+    _shim_ensure_utils3d()
+    _ffdir = os.path.dirname(os.path.abspath(__file__))
+    faltan = []
+    for nombre, imp in [
+            ("moge-v2",
+             f"import sys; sys.path.insert(0, '{_ffdir}'); "
+             "import run as R; R._shim_ensure_utils3d(); "
+             "from moge.model.v2 import MoGeModel"),
+            ("sklearn", "from sklearn.linear_model import RANSACRegressor"),
+            ("cv2", "import cv2"),
+            ("huggingface_hub", "import huggingface_hub")]:
+        r = subprocess.run(f"python3 -c \"{imp}; print('OK-{nombre}')\"",
+                           shell=True, capture_output=True, text=True)
+        if f"OK-{nombre}" in r.stdout:
+            print(f"  VERIFY {nombre}: OK")
+        else:
+            print(f"  VERIFY {nombre}: FALTA")
+            faltan.append(nombre)
+    if faltan:
+        raise SystemExit(f"*** INSTALAR INCOMPLETO, falta: {faltan}. "
+                         "Re-corre esta celda ***")
     print("  MODELOS-OK")
 
 
@@ -303,6 +495,8 @@ def fase_lote(vid, fmm, segdir, segs):
         raise SystemExit("*** SIN GPU: activa acelerador (Settings -> Accelerator -> GPU) ***")
     import cv2
     from sklearn.linear_model import RANSACRegressor
+    # Shim embebido (ver arriba): MoGe lo busca PRIMERO.
+    _shim_ensure_utils3d()
     from moge.model.v2 import MoGeModel
     res = f"{W}/Resultados/{vid}"
     os.makedirs(res, exist_ok=True)
