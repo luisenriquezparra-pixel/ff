@@ -132,25 +132,34 @@ def fase_split(vid, t):
     kept = []
 
     def _col(row, *aliases):
-        norm = {k.strip().lower(): k for k in row.keys()}
+        norm = {}
+        for k in row.keys():
+            if not isinstance(k, str):
+                continue
+            norm[k.strip().lower()] = k
         for a in aliases:
             if a in norm:
                 return row[norm[a]]
         return None
 
     with open(csvp) as f:
-        rows = list(csv.DictReader(f))
-    if rows:
-        hdr = list(rows[0].keys())
-        t0 = _col(rows[0], "start time (seconds)", "start time", "start_time",
-                  "start (seconds)", "start")
-        t1 = _col(rows[0], "end time (seconds)", "end time", "end_time",
-                  "end (seconds)", "end")
-        s0 = _col(rows[0], "start timecode", "start_timecode", "start_tc", "start tc")
-        s1 = _col(rows[0], "end timecode", "end_timecode", "end_tc", "end tc")
-        if t0 is None or t1 is None or s0 is None or s1 is None:
-            raise SystemExit("*** CSV con columnas desconocidas. Vistas: "
-                             f"{hdr}. Pega esto para ajustar alias ***")
+        lines = f.read().splitlines()
+    # El CSV de list-scenes trae una 1ra linea portada ("Timecode List:,...");
+    # se lee desde la linea que empiece con Scene (probado en vivo 2026-10-03).
+    hi = 0
+    while hi < len(lines) and not lines[hi].strip().lower().startswith("scene"):
+        hi += 1
+    if hi >= len(lines):
+        raise SystemExit("*** CSV sin linea 'Scene Number'. Primeras 3 lineas: "
+                         f"{lines[:3]}. Pega esto para ajustar ***")
+    rows = list(csv.DictReader(lines[hi:]))
+    hdr = list(rows[0].keys()) if rows else []
+    if rows and (_col(rows[0], "start time (seconds)", "start time", "start_time",
+                      "start (seconds)", "start") is None
+                 or _col(rows[0], "start timecode", "start_timecode",
+                         "start_tc", "start tc") is None):
+        raise SystemExit("*** CSV con columnas desconocidas. Vistas: "
+                         f"{hdr}. Pega esto para ajustar alias ***")
     for r in rows:
         t0 = _col(r, "start time (seconds)", "start time", "start_time",
                   "start (seconds)", "start")
@@ -158,7 +167,13 @@ def fase_split(vid, t):
                   "end (seconds)", "end")
         s0 = _col(r, "start timecode", "start_timecode", "start_tc", "start tc")
         s1 = _col(r, "end timecode", "end_timecode", "end_tc", "end tc")
-        if float(t1) - float(t0) < 2.0:
+        if not t0 or not t1 or not s0 or not s1:
+            continue
+        try:
+            dur = float(t1) - float(t0)
+        except ValueError:
+            continue
+        if dur < 2.0:
             continue
         nm = f"seg{len(kept) + 1:02d}"
         sh(f"ffmpeg -y -v error -ss {s0} -to {s1} "
