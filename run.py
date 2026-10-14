@@ -3,16 +3,26 @@
     !python3 ff/run.py --instalar   (solo modelos)
     VID = 'nombre'                   (celda aparte)
     !python3 ff/run.py $VID          (todo -> SOLO BVH en /kaggle/working/)
+    # MODO DATASET MASIVO (para tu pana: IA + motor 3D):
+    !python3 ff/run.py --lote [--input-dir /kaggle/input/dataset_futbol] [--output-dir /kaggle/working/dataset_procesado] [--f-mm 24] [-t 27] [--zip]
+    !python3 ff/run.py --source /ruta/video.mp4 --out_dir /kaggle/working/dataset_procesado [--f-mm 24]
 Receta: -s, --f-mm 24, --no-render, PySceneDetect -t 27, MoGe-2 vitb,
-tobillos 7x7, std>6cm = descartado. Salida: {VID}_{seg}_id{ID}_{n}f.bvh
-y nada mas. 1 persona = 1 ID = 1 BVH. <60 frames = descartado con aviso.
+tobillos 7x7, std>6cm = descartado. Salida simple: {VID}_{seg}_id{ID}_{n}f.bvh
+y nada mas. Salida dataset: por video {VID}/ con .bvh (Unity/Unreal/Blender)
++ .pt corregido + .npz listo-para-entrenar (tensores puros sin parsear).
+1 persona = 1 ID = 1 BVH + 1 PT + 1 NPZ. <60 frames = descartado con aviso.
+.bvh vs .pt/.npz: .bvh = jerarquia de huesos para motores de juego.
+.pt/.npz = body_pose/global_orient/transl/betas como floats listos para
+PyTorch/TensorFlow sin perdida ni parser. Para entrenar usa .pt/.npz.
 EDOD: ningun path se asume. Todo se DESCRIBE (nombre + candidatos +
 validador por CONTENIDO) y la ley resolver() lo encuentra donde este.
 Personas = INDICES en arrays IDS[10], no objetos. Leyes: TRACK, TRACKLET,
 POSE-ID, PISO-ID, EXPORT-ID. Sin clases, sin self: datos + leyes.
 SMPLX via API (Secrets); resto publico. Sin secretos ni pesos adentro.
 Codigo libre: si falta algo (yaml, ultralytics) se autocrea o avisa VACIO.
-Nada revienta a mitad del lote: cada ID falla solo, los demas siguen."""
+Nada revienta a mitad del lote: cada ID falla solo, los demas siguen.
+Cada VIDEO falla solo, los demas videos siguen."""
+import argparse
 import csv
 import datetime
 import glob
@@ -33,6 +43,16 @@ T_DEFAULT = 27
 FPS = 30
 MAX_IDS = 10
 MIN_FRAMES = 60
+
+# --------------------------- CAPA DATASET MASIVO (para tu pana)
+# Que existe: carpeta de entrada con N videos de futbol, carpeta de salida
+# con 1 subcarpeta por video. Cada subcarpeta lleva por ID:
+#   .bvh (motor 3D: Unity/Unreal/Blender) + .pt (torch puro) + .npz (numpy
+#   listo para entrenar). Tablas, no ramas: extensiones y defaults aqui.
+DATASET_IN_DEFAULT = "/kaggle/input/dataset_futbol"
+DATASET_OUT_DEFAULT = f"{W}/dataset_procesado"
+DATASET_ZIP_DEFAULT = f"{W}/dataset_futbol_final.zip"
+VIDEO_EXTS = (".mp4", ".avi", ".mov", ".mkv")
 
 
 # ---------------------------------------- CAPA IDS[10] (EDOD SoA)
@@ -969,22 +989,327 @@ def escribir_bvh(d, bvh_path):
         lines.append(" ".join(vals))
     with open(bvh_path, "w") as f:
         f.write("\n".join(lines) + "\n")
-def fase_lote(vid, fmm, segdir, segs):
-    phase("[4/4] LOTE-MULTI (TRACK->TRACKLET->POSE/PISO/EXPORT por ID->SOLO BVH)")
+# -------------------------------------- EXPORT DATASET (para tu pana)
+# Ley EXPORT-ID extendida: por cada ID que genera BVH tambien se guarda
+# el .pt corregido (torch puro) y un .npz listo-para-entrenar
+# (body_pose/global_orient/transl/betas como floats, sin parsear texto).
+# .bvh = Unity/Unreal/Blender. .pt/.npz = PyTorch/TensorFlow directo.
+_MOGE_CACHE = None
+
+
+def obtener_moge():
+    """MoGe-2 se carga una sola vez por proceso (lote masivo)."""
+    global _MOGE_CACHE
+    if _MOGE_CACHE is not None:
+        return _MOGE_CACHE
+    _shim_ensure_utils3d()
+    from moge.model.v2 import MoGeModel
+    buscar_smplx()
+    buscar_moge()
+    _MOGE_CACHE = MoGeModel.from_pretrained(MOGE).cuda().eval()
+    return _MOGE_CACHE
+
+
+def exportar_npz_entrenamiento(d, npz_path, meta=None):
+    """Guarda tensores puros para entrenar sin parser de .bvh.
+    Devuelve npz_path. Nunca revienta: si falta una clave, guarda lo que haya."""
+    import numpy as np
+    try:
+        import torch
+    except Exception:
+        torch = None
+
+    def _tonpy(x):
+        try:
+            if torch is not None and torch.is_tensor(x):
+                return x.detach().cpu().numpy()
+            return np.asarray(x)
+        except Exception:
+            return np.asarray([])
+
+    g = d.get("smpl_params_global", {}) if isinstance(d, dict) else {}
+    datos = {}
+    for k in ["body_pose", "global_orient", "transl", "betas"]:
+        if k in g:
+            try:
+                datos[k] = _tonpy(g[k])
+            except Exception:
+                continue
+    if "kp2d" in d:
+        try:
+            datos["kp2d"] = _tonpy(d["kp2d"])
+        except Exception:
+            pass
+    datos["fps"] = np.asarray([FPS])
+    meta = meta or {}
+    for k, v in meta.items():
+        try:
+            datos[f"meta_{k}"] = np.asarray([str(v)])
+        except Exception:
+            continue
+    os.makedirs(os.path.dirname(os.path.abspath(npz_path)), exist_ok=True)
+    np.savez_compressed(npz_path, **datos)
+    return npz_path
+
+
+def publicar_en_dataset(vid, tag, n, trk, bvh_src, pt_src, dataset_root):
+    """Copia 1 ID al dataset limpio: dataset_root/{vid}/{tag}_{n}f.{bvh,pt,npz}.
+    Genera el .npz al lado del .bvh y anota manifest.csv. Devuelve carpeta."""
+    import torch
+    if not dataset_root:
+        return None
+    # Si el usuario paso .../dataset_procesado/{vid} como out_dir, no duplicar.
+    norm = os.path.normpath(dataset_root)
+    root = os.path.dirname(norm) if os.path.basename(norm) == vid else norm
+    carpeta = os.path.join(root, vid)
+    os.makedirs(carpeta, exist_ok=True)
+    base = f"{vid}_{tag}_{n}f"
+    dst_bvh = os.path.join(carpeta, base + ".bvh")
+    dst_pt = os.path.join(carpeta, base + ".pt")
+    dst_npz = os.path.join(carpeta, base + ".npz")
+    for src, dst in [(bvh_src, dst_bvh), (pt_src, dst_pt)]:
+        try:
+            if src and os.path.isfile(src) and os.path.abspath(src) != os.path.abspath(dst):
+                shutil.copy2(src, dst)
+            elif src and os.path.abspath(src) == os.path.abspath(dst):
+                pass
+        except Exception as e:
+            print(f"    [DATASET] no pude copiar {src} -> {dst} ({e})")
+    try:
+        d = torch.load(pt_src, map_location="cpu")
+        exportar_npz_entrenamiento(d, dst_npz, {"vid": vid, "tag": tag,
+                                               "id": trk, "frames": n})
+    except Exception as e:
+        print(f"    [DATASET] npz FAIL id={trk} ({type(e).__name__}: {str(e)[:100]})")
+        dst_npz = None
+    try:
+        man = os.path.join(root, "manifest.csv")
+        nuevo = not os.path.exists(man)
+        with open(man, "a", newline="") as f:
+            w = csv.writer(f)
+            if nuevo:
+                w.writerow(["vid", "seg", "id", "frames", "bvh", "pt", "npz"])
+            seg = tag.split("_id")[0] if "_id" in tag else tag
+            w.writerow([vid, seg, trk, n,
+                        os.path.basename(dst_bvh) if os.path.exists(dst_bvh) else "",
+                        os.path.basename(dst_pt) if os.path.exists(dst_pt) else "",
+                        os.path.basename(dst_npz) if dst_npz and os.path.exists(dst_npz) else ""])
+    except Exception as e:
+        print(f"    [DATASET] manifest FAIL ({e})")
+    return carpeta
+
+
+def listar_videos_dataset(input_dir=None):
+    """Describe videos por CONTENIDO (existen y pesan >10KB), no por nombre."""
+    cands = []
+    bases = []
+    if input_dir and os.path.isdir(input_dir):
+        bases = [input_dir]
+    else:
+        for b in [DATASET_IN_DEFAULT, "/kaggle/input", IN, "."]:
+            if os.path.isdir(b):
+                bases.append(b)
+    for b in bases:
+        for ext in VIDEO_EXTS + tuple(e.upper() for e in VIDEO_EXTS):
+            cands.extend(glob.glob(os.path.join(b, f"*{ext}")))
+            cands.extend(glob.glob(os.path.join(b, "**", f"*{ext}"), recursive=True))
+    uniq, vistos = [], set()
+    for p in sorted(set(cands)):
+        try:
+            rp = os.path.realpath(p)
+            if rp in vistos or not os.path.isfile(p) or os.path.getsize(p) <= 10000:
+                continue
+            vistos.add(rp)
+            uniq.append(p)
+        except Exception:
+            continue
+    return uniq
+
+
+def asegurar_video_en_IN(video_path):
+    """El pipeline viejo busca por VID en inputs_demo/. Aqui se asegura que
+    cualquier --source exista ahi (copia si hace falta) y devuelve el VID."""
+    if not os.path.isfile(video_path):
+        raise SystemExit(f"*** --source no existe: {video_path} ***")
+    base = os.path.basename(video_path)
+    if not base.lower().endswith(VIDEO_EXTS):
+        print(f"  [WARN] extension rara en {base}, intento igual...")
+    vid = base
+    for ext in VIDEO_EXTS + tuple(e.upper() for e in VIDEO_EXTS):
+        if vid.endswith(ext):
+            vid = vid[: -len(ext)]
+            break
+    else:
+        if "." in vid:
+            vid = vid.rsplit(".", 1)[0]
+    os.makedirs(IN, exist_ok=True)
+    dst = os.path.join(IN, base)
+    try:
+        if os.path.abspath(video_path) != os.path.abspath(dst):
+            if not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(video_path):
+                shutil.copy2(video_path, dst)
+                print(f"  [ENCONTRADO] VIDEO {vid}: {dst} (copiado de --source)")
+    except Exception as e:
+        raise SystemExit(f"*** no pude copiar --source a {dst}: {e} ***")
+    ok, det = v_mp4(dst)
+    if not ok:
+        raise SystemExit(f"*** video ilegible {dst} ({det}) ***")
+    return vid
+
+
+def empaquetar_dataset(dataset_root, zip_path=None):
+    """Zip LIMPIO: solo dataset_root (bvh+pt+npz+manifest), sin pesos ni installs."""
+    if not dataset_root or not os.path.isdir(dataset_root):
+        print("  [ZIP] nada que comprimir (sin dataset_root)")
+        return None
+    zip_path = zip_path or DATASET_ZIP_DEFAULT
+    if zip_path.endswith(".zip"):
+        base = zip_path[: -4]
+    else:
+        base = zip_path
+    try:
+        parent = os.path.dirname(os.path.abspath(base))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+    except Exception:
+        pass
+    # Limpieza: nunca meter basura de instalacion si alguien la metio ahi.
+    for basura in ["__pycache__", ".ipynb_checkpoints"]:
+        bp = os.path.join(dataset_root, basura)
+        if os.path.exists(bp):
+            try:
+                shutil.rmtree(bp, ignore_errors=True)
+            except Exception:
+                pass
+    out = shutil.make_archive(base, "zip", dataset_root)
+    try:
+        mb = os.path.getsize(out) / 1e6
+    except Exception:
+        mb = -1
+    print(f"  [ZIP-OK] {out} ({mb:.1f}MB) <- SOLO dataset limpio, baja con 1 clic")
+    return out
+
+
+def _parse_flags_dataset(argv):
+    """Parser tolerante: acepta --out_dir y --out-dir, --f-mm y --f_mm, etc.
+    Devuelve dict con source/lote/input_dir/output_dir/fmm/threshold/zip/device."""
+    f = {"source": None, "lote": False, "input_dir": None, "output_dir": None,
+         "fmm": FMM_DEFAULT, "threshold": T_DEFAULT, "zip": True, "device": "cuda",
+         "zip_path": None}
+    i = 0
+    n = len(argv)
+    while i < n:
+        a = argv[i]
+        al = a.lower().replace("_", "-").split("=", 1)[0]
+
+        def _val(j):
+            if "=" in a:
+                return a.split("=", 1)[1]
+            if j + 1 < n and not argv[j + 1].startswith("-"):
+                return argv[j + 1]
+            return None
+
+        def _consume(j):
+            if "=" in a:
+                return j + 1
+            if j + 1 < n and not argv[j + 1].startswith("-"):
+                return j + 2
+            return j + 1
+
+        if al in ("--source", "--video", "--in-file"):
+            v = _val(i)
+            if v:
+                f["source"] = v
+            i = _consume(i)
+        elif al in ("--out-dir", "--outdir", "--output-dir", "--outputdir", "--out", "-o"):
+            v = _val(i)
+            if v:
+                f["output_dir"] = v
+            i = _consume(i)
+        elif al in ("--input-dir", "--inputdir", "--input", "--in-dir", "--indir"):
+            v = _val(i)
+            if v:
+                f["input_dir"] = v
+            i = _consume(i)
+        elif al in ("--lote", "--batch", "--todos", "--all"):
+            f["lote"] = True
+            i += 1
+        elif al in ("--f-mm", "--fmm", "--f-mm-n", "--frames-mm"):
+            v = _val(i)
+            try:
+                f["fmm"] = int(v)
+            except Exception:
+                pass
+            i = _consume(i)
+        elif al in ("--threshold", "--thresh", "-t", "--t", "--scenedetect-t"):
+            v = _val(i)
+            try:
+                f["threshold"] = int(v)
+            except Exception:
+                pass
+            i = _consume(i)
+        elif al in ("--zip", "--zip-out", "--comprimir"):
+            v = _val(i)
+            if v is None:
+                f["zip"] = True
+                i += 1
+            else:
+                f["zip"] = str(v).lower() not in ("0", "false", "no", "off")
+                i = _consume(i)
+        elif al in ("--no-zip", "--sin-zip", "--no-comprimir"):
+            f["zip"] = False
+            i += 1
+        elif al in ("--zip-path", "--zip-file"):
+            v = _val(i)
+            if v:
+                f["zip_path"] = v
+            i = _consume(i)
+        elif al in ("--device", "--dispositivo"):
+            v = _val(i)
+            if v:
+                f["device"] = v
+            i = _consume(i)
+        else:
+            i += 1
+    # Atajo: un .mp4 suelto como argv[0] = --source implicito.
+    if not f["source"] and not f["lote"] and argv:
+        for tok in argv:
+            if not tok.startswith("-") and os.path.isfile(tok) \
+                    and tok.lower().endswith(VIDEO_EXTS):
+                f["source"] = tok
+                break
+    return f
+
+
+def fase_lote(vid, fmm, segdir, segs, dataset_out=None):
+    phase("[4/4] LOTE-MULTI (TRACK->TRACKLET->POSE/PISO/EXPORT por ID->BVH+PT+NPZ)")
     import torch
     if not torch.cuda.is_available():
         raise SystemExit("*** SIN GPU: activa acelerador (Settings -> Accelerator -> GPU) ***")
-    # Shim embebido (ver arriba): MoGe lo busca PRIMERO.
-    _shim_ensure_utils3d()
-    from moge.model.v2 import MoGeModel
+    moge = obtener_moge()
     res = f"{W}/Resultados/{vid}"
     os.makedirs(res, exist_ok=True)
     os.environ["GVHMR_BODY_MODELS"] = BM
-    # Sin SMPL-X no hay BVH: se busca donde este, no donde se supone.
-    buscar_smplx()
-    buscar_moge()
-    moge = MoGeModel.from_pretrained(MOGE).cuda().eval()
     bvhs = []
+
+    def _cerrar_id(trk, tag, R, n_override=None):
+        """Regenera BVH+NPZ desde el .pt ya corregido y publica al dataset."""
+        corr = f"{R}/{tag}_corrected.pt"
+        d = torch.load(corr, map_location="cpu")
+        n = n_override or d["smpl_params_global"]["body_pose"].shape[0]
+        bvh = f"{W}/{vid}_{tag}_{n}f.bvh"
+        escribir_bvh(d, bvh)
+        npz_w = f"{W}/{vid}_{tag}_{n}f.npz"
+        try:
+            exportar_npz_entrenamiento(d, npz_w, {"vid": vid, "tag": tag,
+                                                 "id": trk, "frames": n})
+        except Exception as e:
+            print(f"    id={trk}: npz-regen FAIL ({e})")
+        bvhs.append(bvh)
+        if dataset_out:
+            publicar_en_dataset(vid, tag, n, trk, bvh, corr, dataset_out)
+        return bvh, n
+
     for nm in segs:
         R = f"{res}/{nm}"
         os.makedirs(R, exist_ok=True)
@@ -1010,12 +1335,20 @@ def fase_lote(vid, fmm, segdir, segs):
                 try:
                     corr = f"{R}/{tag}_corrected.pt"
                     if os.path.exists(corr):
-                        print(f"    id={trk}: YA HECHO (regenero BVH del .pt)")
+                        print(f"    id={trk}: YA HECHO (regenero BVH+NPZ del .pt)")
                         d = torch.load(corr, map_location="cpu")
                         n = d["smpl_params_global"]["body_pose"].shape[0]
                         bvh = f"{W}/{vid}_{tag}_{n}f.bvh"
                         escribir_bvh(d, bvh)
+                        try:
+                            exportar_npz_entrenamiento(
+                                d, f"{W}/{vid}_{tag}_{n}f.npz",
+                                {"vid": vid, "tag": tag, "id": trk, "frames": n})
+                        except Exception:
+                            pass
                         bvhs.append(bvh)
+                        if dataset_out:
+                            publicar_en_dataset(vid, tag, n, trk, bvh, corr, dataset_out)
                         print(f"    id={trk}: BVH-OK -> {bvh}")
                         continue
                     odir = f"{OUT}/{os.path.splitext(os.path.basename(tracklet))[0]}"
@@ -1046,16 +1379,95 @@ def fase_lote(vid, fmm, segdir, segs):
                     torch.save(d, corr)
                     bvh = f"{W}/{vid}_{tag}_{n}f.bvh"
                     escribir_bvh(d, bvh)
+                    try:
+                        exportar_npz_entrenamiento(
+                            d, f"{W}/{vid}_{tag}_{n}f.npz",
+                            {"vid": vid, "tag": tag, "id": trk, "frames": n})
+                    except Exception as e:
+                        print(f"    id={trk}: npz FAIL ({e})")
                     bvhs.append(bvh)
+                    if dataset_out:
+                        publicar_en_dataset(vid, tag, n, trk, bvh, corr, dataset_out)
                     print(f"    id={trk}: BVH-OK frames={n} -> {bvh}  <-- baja con 1 clic")
+                    if dataset_out:
+                        print(f"    id={trk}: DATASET-OK (.bvh motor3D + .pt/.npz para IA)")
                 except Exception as e:
                     ID_ACT[i] = False
                     print(f"    id={trk}: FAIL {type(e).__name__}: "
                           f"{str(e)[:200]} (los demas siguen)")
         except Exception as e:
             print(f"  {nm}: FAIL {type(e).__name__}: {str(e)[:300]}")
-    print(f"  LOTE FIN: {len(bvhs)} BVH en {W}/")
+    print(f"  LOTE FIN: {len(bvhs)} BVH en {W}/"
+          + (f" + dataset en {dataset_out}/" if dataset_out else ""))
     return bvhs
+
+
+def procesar_un_video_para_dataset(vid, fmm, t, dataset_root):
+    """Un video completo: SPLIT + LOTE con publicacion al dataset.
+    Un video nunca revienta el batch: devuelve (vid, n_bvh, error_o_None)."""
+    try:
+        segdir, segs = fase_split(vid, t)
+        bvhs = fase_lote(vid, fmm, segdir, segs, dataset_out=dataset_root)
+        return (vid, len(bvhs), None)
+    except Exception as e:
+        print(f"  [{vid}] VIDEO-FAIL {type(e).__name__}: {str(e)[:300]} (sigo con el siguiente)")
+        return (vid, 0, f"{type(e).__name__}: {str(e)[:200]}")
+
+
+def main_dataset(flags):
+    """Batch masivo: N videos -> N carpetas con 1 BVH+PT+NPZ por ID + zip limpio."""
+    fmm = flags["fmm"]
+    t = flags["threshold"]
+    print(f"== DATASET MASIVO | FUTBOL -> BVH (motor) + PT/NPZ (IA) | FMM={fmm} T={t} ==")
+    validar_entorno()
+    fase_modelos()
+    # --- modo 1 video suelto: python3 ff/run.py --source video.mp4 --out_dir carpeta
+    if flags["source"]:
+        src = flags["source"]
+        out_param = flags["output_dir"] or DATASET_OUT_DEFAULT
+        print(f"SOURCE={src} OUT_PARAM={out_param}")
+        vid = asegurar_video_en_IN(src)
+        # out_param puede ser .../dataset_procesado o .../dataset_procesado/{vid}
+        segdir, segs = fase_split(vid, t)
+        bvhs = fase_lote(vid, fmm, segdir, segs, dataset_out=out_param)
+        print(f"\nFIN-SOURCE: {len(bvhs)} IDs (1 ID = 1 BVH + 1 PT + 1 NPZ) para '{vid}'.")
+        print("  Para tu pana: IA usa .pt/.npz, motor 3D (Unity/Unreal/Blender) usa .bvh.")
+        return bvhs
+    # --- modo lote: python3 ff/run.py --lote [--input-dir ...] [--output-dir ...]
+    in_dir = flags["input_dir"]
+    out_root = flags["output_dir"] or DATASET_OUT_DEFAULT
+    os.makedirs(out_root, exist_ok=True)
+    videos = listar_videos_dataset(in_dir)
+    if not videos:
+        donde = in_dir or f"{DATASET_IN_DEFAULT}, /kaggle/input, {IN}"
+        raise SystemExit(f"*** SIN VIDEOS para lote. Busque en: {donde}. "
+                         "Sube el Dataset (Add Input) con .mp4/.avi/.mov ***")
+    print(f"  VIDEOS-LOTE ({len(videos)}):")
+    for v in videos:
+        print(f"   - {v}")
+    ok_total, fail_total = 0, []
+    for idx, vpath in enumerate(videos):
+        print(f"\n===== VIDEO [{idx + 1}/{len(videos)}] {os.path.basename(vpath)} =====")
+        try:
+            vid = asegurar_video_en_IN(vpath)
+        except SystemExit as e:
+            print(f"  [{vpath}] SKIP: {e}")
+            fail_total.append((vpath, str(e)[:150]))
+            continue
+        vid2, n, err = procesar_un_video_para_dataset(vid, fmm, t, out_root)
+        ok_total += n
+        if err:
+            fail_total.append((vid2, err))
+    print(f"\n===== DATASET FIN: {ok_total} archivos-ID desde {len(videos)} videos =====")
+    print(f"  Estructura: {out_root}/<video>/{{vid}}_{{seg}}_id{{ID}}_{{n}}f.{{bvh,pt,npz}}")
+    print("  IA -> .pt/.npz | Motor3D -> .bvh | manifest.csv con el indice.")
+    if flags["zip"]:
+        empaquetar_dataset(out_root, flags["zip_path"] or DATASET_ZIP_DEFAULT)
+    if fail_total:
+        print(f"  FALLOS ({len(fail_total)}, no frenaron el lote):")
+        for v, e in fail_total[:10]:
+            print(f"   - {v}: {e}")
+    return ok_total
 
 
 def main(argv=None):
@@ -1067,10 +1479,17 @@ def main(argv=None):
         return
     if not argv:
         raise SystemExit("*** Sin VID: corre como !python3 ff/run.py $VID "
-                         "(celda aparte con VID = 'nombre') ***")
+                         "(celda aparte con VID = 'nombre') "
+                         "o lote: !python3 ff/run.py --lote ***")
+    # Nuevo: flags dataset (--source/--lote/--out_dir/...) tienen prioridad.
+    flags = _parse_flags_dataset(argv)
+    if flags["source"] or flags["lote"]:
+        return main_dataset(flags)
     if argv[0].startswith("--"):
-        raise SystemExit("*** Flags validos: --instalar | $VID [FMM] [T]. "
-                         "Ej: !python3 ff/run.py $VID ***")
+        raise SystemExit("*** Flags validos: --instalar | $VID [FMM] [T] | "
+                         "--source <mp4> --out_dir <carpeta> | --lote "
+                         "[--input-dir D] [--output-dir D] [--zip]. "
+                         "Ej: !python3 ff/run.py --lote ***")
     vid = argv[0]
     if vid.endswith(".mp4"):
         vid = vid[:-4]
